@@ -1,0 +1,358 @@
+// NtcDecompress.compute
+// GPU decompression of an NTC texture set into ordinary PBR RenderTextures.
+//
+// This is the single compute kernel reused by BOTH runtime paths:
+//   * mode2 (on-Load) : dispatched once over the whole image at load time ->普通贴图缓存
+//   * mode3 (on-Sample streaming): dispatched per visible tile into a capped-size cache
+//
+// It ports the official RTXNTC DecompressINT8.hlsl math (48->64->48->32->16 INT8 MLP,
+// HGELUClamp activation) but adapted to Unity's compute conventions:
+//   - Plain compute uniforms instead of a ConstantBuffer<NtcDecompressConstants> struct.
+//   - Named RWTexture2D outputs (BaseColor / Normal / Mask / AO) matching URP Lit inputs,
+//     instead of the official unbounded RWTexture2D<float4>[] UAV array.
+//   - A groupshared weight cache (s_MatrixB) so the ~9 KB weight buffer is read ONCE per
+//     128-thread group instead of once per pixel  -> this is the main bandwidth win.
+//   - A software int8 dot product fallback so the DEFAULT variant compiles on FXC/DX11.
+//     Set NTC_USE_DP4A to 1 (needs DX12/Vulkan + SM6.4) to use the hardware dot4add_i8packed.
+
+// ------------------------------------------------------------------ DP4A toggle
+// 0 = portable software int8 dot (FXC/DX11/Vulkan compatible, still groupshared-cached).
+// 1 = hardware dot4add_i8packed (needs SM6.4 DXC AND the target compiler must actually
+//     implement the intrinsic). Unity's D3D12 (DXC) path supports it; Unity's Vulkan
+//     compute compiler does NOT implement dot4add_i8packed even though the API/driver
+//     may support VK_KHR_shader_integer_dot_product -> auto-select per Unity SHADER_API.
+#ifndef NTC_USE_DP4A
+    #if defined(SHADER_API_D3D12) && !defined(SHADER_API_VULKAN)
+        #define NTC_USE_DP4A 1
+    #else
+        #define NTC_USE_DP4A 0
+    #endif
+#endif
+
+#if NTC_USE_DP4A
+#pragma use_dxc
+#endif
+
+#pragma kernel NtcDecompressMain
+
+// ------------------------------------------------------------------ network constants
+#define NTC_MLP_FEATURES            16
+#define NTC_FEATURES_PER_LAYER      4
+#define NTC_MLP_POS_ENC_WAVES       3
+#define NTC_MLP_INPUT_CHANNELS      48
+#define NTC_MLP_HIDDEN0_CHANNELS    64
+#define NTC_MLP_HIDDEN1_CHANNELS    48
+#define NTC_MLP_HIDDEN2_CHANNELS    32
+#define NTC_MLP_OUTPUT_CHANNELS     16
+#define MAX_INPUT_SIZE              64   // max IN across layers
+#define MAX_OUTPUT_SIZE             64   // max OUT across layers
+
+#define NTC_HGELU_MAXVALUE  3
+#define NTC_HGELU_INVSTEP   80
+#define NTC_HGELU_BIAS      -113
+
+#define BLOCK_W 16
+#define BLOCK_H 8
+
+static const float c_InputScale = 127.5;
+
+// ------------------------------------------------------------------ resources
+Texture2DArray<float4> _Latents;
+SamplerState           sampler_linear_repeat; // Unity inline sampler: bilinear + repeat
+ByteAddressBuffer      _Weights;
+
+// PBR outputs (unused slots are bound to a 1x1 dummy by C#, and disabled via _OutputEnable).
+RWTexture2D<float4> _OutBaseColor;
+RWTexture2D<float4> _OutNormal;
+RWTexture2D<float4> _OutMask;   // R=metallic, A=smoothness
+RWTexture2D<float4> _OutAO;
+
+// ------------------------------------------------------------------ uniforms
+int4 _NtcColorMip;          // (neuralMip, asint(positionLod), asint(positionScale), 0)
+int4 _NtcWeightOffsets;
+int4 _NtcBiasOffsets;
+int4 _NtcScaleOffsets;
+int4 _MipImageSize;         // (mipWidth, mipHeight, 0, 0) -- size of the mip we decode
+int4 _SrcRect;              // (srcLeft, srcTop, srcRight, srcBottom) in mip pixels
+int4 _DstOffset;            // (dstLeft - srcLeft, dstTop - srcTop, 0, 0)
+
+// Channel routing (network output channel index, -1 = absent):
+int4 _ColorChannels;        // (r, g, b, colorIsSrgb)
+int4 _NormalChannels;       // (x, y, z, 0)
+int4 _MaskChannels;         // (metalCh, smoothCh, smoothIsRoughness, 0)
+int   _AOChannel;
+int   _AlphaChannel;        // cutout/opacity mask channel, -1 = absent -> BaseColor.a stays 1.0
+int4 _OutputEnable;         // (baseColor, normal, mask, ao) 1/0
+
+// ------------------------------------------------------------------ groupshared
+groupshared float4 s_Scale[MAX_OUTPUT_SIZE / 4];
+groupshared int4   s_Bias [MAX_OUTPUT_SIZE / 4];
+groupshared uint   s_MatrixB[MAX_OUTPUT_SIZE][MAX_INPUT_SIZE / 4];
+
+// ------------------------------------------------------------------ helpers
+int4 Ntc_UnpackS8(uint p)
+{
+    int4 v = int4(int(p & 0xFF), int((p >> 8) & 0xFF), int((p >> 16) & 0xFF), int((p >> 24) & 0xFF));
+    return v - (v > 127 ? 256 : 0);
+}
+
+uint Ntc_PackS8(int4 v)
+{
+    return (uint(v.x & 0xFF))
+         | (uint(v.y & 0xFF) << 8)
+         | (uint(v.z & 0xFF) << 16)
+         | (uint(v.w & 0xFF) << 24);
+}
+
+int Ntc_Dot4AddI8(uint a, uint b, int acc)
+{
+#if NTC_USE_DP4A
+    return dot4add_i8packed(a, b, acc);
+#else
+    int4 av = Ntc_UnpackS8(a);
+    int4 bv = Ntc_UnpackS8(b);
+    return acc + av.x * bv.x + av.y * bv.y + av.z * bv.z + av.w * bv.w;
+#endif
+}
+
+float4 NtcHGELUClamp_ForwardFloat(float4 x)
+{
+    return min(x, float(NTC_HGELU_MAXVALUE)) * saturate(mad(x, 0.333333, 0.5));
+}
+
+int4 NtcHGELUClamp_QuantizeFloat(float4 x)
+{
+    return int4(round(x * float(NTC_HGELU_INVSTEP)) + float(NTC_HGELU_BIAS));
+}
+
+float4 NtcEvaluatePositionalEncoding(float2 posf)
+{
+    float4 r;
+    r.x = frac(posf.x) * 2 - 1;
+    r.y = frac(posf.y) * 2 - 1;
+    r.z = frac(posf.x + 0.25) * 2 - 1;
+    r.w = frac(posf.y + 0.25) * 2 - 1;
+    return r;
+}
+
+float NtcSrgbToLinear(float c)
+{
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
+// Fill the packed int8 network-input vector for one texel.
+void NtcPrepareInputs(int2 texel, float2 uv, int neuralMip, float positionLod, float positionScale,
+                      out uint networkInputs[NTC_MLP_INPUT_CHANNELS / 4])
+{
+    [unroll]
+    for (int i = 0; i < NTC_MLP_INPUT_CHANNELS / 4; ++i)
+        networkInputs[i] = 0;
+
+    int w, h, arraySize;
+    _Latents.GetDimensions(w, h, arraySize);
+
+    // Two latent grids (neuralMip and neuralMip+1), 4 layers each (16 features total).
+    [unroll]
+    for (int grid = 0; grid < 2; ++grid)
+    {
+        int lod = neuralMip + grid;
+        int featureOffset = grid * NTC_MLP_FEATURES; // 0 and 16
+        [unroll]
+        for (int layerIndex = 0; layerIndex < NTC_MLP_FEATURES / NTC_FEATURES_PER_LAYER; ++layerIndex)
+        {
+            bool mask = (layerIndex == 0) || (layerIndex < arraySize);
+            float4 s = _Latents.SampleLevel(sampler_linear_repeat, float3(uv, layerIndex), lod);
+            // NOTE: no .bgra unswizzle here. The official reference code applies .bgra because it
+            // samples a *real* hardware BGRA4_UNORM texture, whose format-defined bit layout the GPU
+            // auto-unpacks to (r=nibble2, g=nibble1, b=nibble0, a=nibble3); .bgra then restores the
+            // physical nibble order (0,1,2,3). Our NtcAssetBuilder.BuildLatentTexture() instead manually
+            // expands the 4 nibbles straight into an RGBA32 texture in physical order (r=nibble0,
+            // g=nibble1, b=nibble2, a=nibble3) -- Unity's plain RGBA32 sampling does no format-specific
+            // reordering, so `s` here is ALREADY in the correct (nibble0,1,2,3) order. Re-applying .bgra
+            // would swap nibble0<->nibble2 (an R/B swap per 4-feature group) and corrupt every MLP input,
+            // which is what caused the "distorted" unpack results.
+            s = mask ? s * (2.0 * c_InputScale) - c_InputScale - 0.5 : 0.0;
+            networkInputs[(featureOffset / 4) + layerIndex] = Ntc_PackS8(int4(floor(s)));
+        }
+    }
+
+    // Positional encoding + LOD -> last 16 inputs (4 uints).
+    float2 posf = float2(texel) * positionScale;
+    int idx = (NTC_MLP_FEATURES * 2) / 4; // 8
+    [unroll]
+    for (int wave = 0; wave < NTC_MLP_POS_ENC_WAVES; ++wave)
+    {
+        float4 enc = NtcEvaluatePositionalEncoding(posf);
+        networkInputs[idx++] = Ntc_PackS8(int4(enc * c_InputScale));
+        posf *= 2.0;
+    }
+    int iLod = int(positionLod * c_InputScale);
+    networkInputs[idx] = Ntc_PackS8(int4(iLod, iLod, 0, 0));
+}
+
+// Load one layer's weights/scale/bias into groupshared, then evaluate.
+// IN/OUT are compile-time literals so the inner loop unrolls.
+#define NTC_DEFINE_LAYER(FuncName, IN, OUT, OUTPUT_LAYER)                                       \
+void FuncName(int weightOffset, int biasOffset, int scaleOffset, int linearThreadIndex,        \
+              uint inputArray[IN / 4], out uint outputArray[OUTPUT_LAYER ? OUT : OUT / 4])      \
+{                                                                                              \
+    GroupMemoryBarrierWithGroupSync();                                                         \
+    if (linearThreadIndex < (OUT) / 4)                                                         \
+    {                                                                                          \
+        uint4 sr = _Weights.Load4(scaleOffset + linearThreadIndex * 16);                       \
+        uint4 br = _Weights.Load4(biasOffset  + linearThreadIndex * 16);                       \
+        s_Scale[linearThreadIndex] = asfloat(sr);                                              \
+        s_Bias [linearThreadIndex] = asint(br);                                                \
+    }                                                                                          \
+    int preloadIndex = linearThreadIndex;                                                      \
+    while (preloadIndex < ((IN) * (OUT)) / 4)                                                  \
+    {                                                                                          \
+        int row = preloadIndex % ((IN) / 4);                                                   \
+        int col = preloadIndex / ((IN) / 4);                                                   \
+        s_MatrixB[col][row] = _Weights.Load(weightOffset + preloadIndex * 4);                  \
+        preloadIndex += BLOCK_W * BLOCK_H;                                                     \
+    }                                                                                          \
+    GroupMemoryBarrierWithGroupSync();                                                         \
+    [loop]                                                                                     \
+    for (uint col = 0; col < (OUT); col += 4)                                                  \
+    {                                                                                          \
+        int4 acc = s_Bias[col / 4];                                                            \
+        [unroll]                                                                               \
+        for (uint row4 = 0; row4 < (IN) / 4; row4++)                                           \
+        {                                                                                      \
+            acc.x = Ntc_Dot4AddI8(inputArray[row4], s_MatrixB[col + 0][row4], acc.x);          \
+            acc.y = Ntc_Dot4AddI8(inputArray[row4], s_MatrixB[col + 1][row4], acc.y);          \
+            acc.z = Ntc_Dot4AddI8(inputArray[row4], s_MatrixB[col + 2][row4], acc.z);          \
+            acc.w = Ntc_Dot4AddI8(inputArray[row4], s_MatrixB[col + 3][row4], acc.w);          \
+        }                                                                                      \
+        float4 results = float4(acc) * s_Scale[col / 4];                                       \
+        if (OUTPUT_LAYER)                                                                      \
+        {                                                                                      \
+            outputArray[col + 0] = asuint(results.x);                                          \
+            outputArray[col + 1] = asuint(results.y);                                          \
+            outputArray[col + 2] = asuint(results.z);                                          \
+            outputArray[col + 3] = asuint(results.w);                                          \
+        }                                                                                      \
+        else                                                                                   \
+        {                                                                                      \
+            results = NtcHGELUClamp_ForwardFloat(results);                                      \
+            outputArray[col / 4] = Ntc_PackS8(NtcHGELUClamp_QuantizeFloat(results));           \
+        }                                                                                      \
+    }                                                                                          \
+}
+
+NTC_DEFINE_LAYER(NtcLayer0, NTC_MLP_INPUT_CHANNELS,   NTC_MLP_HIDDEN0_CHANNELS, false)
+NTC_DEFINE_LAYER(NtcLayer1, NTC_MLP_HIDDEN0_CHANNELS, NTC_MLP_HIDDEN1_CHANNELS, false)
+NTC_DEFINE_LAYER(NtcLayer2, NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_HIDDEN2_CHANNELS, false)
+NTC_DEFINE_LAYER(NtcLayer3, NTC_MLP_HIDDEN2_CHANNELS, NTC_MLP_OUTPUT_CHANNELS,  true)
+
+float ChannelValue(uint outputs[NTC_MLP_OUTPUT_CHANNELS], int ch)
+{
+    if (ch < 0) return 0.0;
+    return saturate(asfloat(outputs[ch]));
+}
+
+[numthreads(BLOCK_W, BLOCK_H, 1)]
+void NtcDecompressMain(uint2 globalIndex : SV_DispatchThreadID, uint2 threadIndex : SV_GroupThreadID)
+{
+    int linearThreadIndex = int(threadIndex.x) + int(threadIndex.y) * BLOCK_W;
+
+    int2 pixelPosition = int2(globalIndex) + int2(_SrcRect.x, _SrcRect.y);
+    int2 mipSize = max(int2(_MipImageSize.x, _MipImageSize.y), 1);
+    float2 uv = (float2(pixelPosition) + 0.5) / float2(mipSize);
+
+    int neuralMip     = _NtcColorMip.x;
+    float positionLod = asfloat(_NtcColorMip.y);
+    float posScale    = asfloat(_NtcColorMip.z);
+
+    // All 128 threads MUST reach the groupshared barriers regardless of the source rect,
+    // so we never early-out before the MLP; only the final UAV store is masked.
+    uint networkInputs[NTC_MLP_INPUT_CHANNELS / 4];
+    NtcPrepareInputs(pixelPosition, uv, neuralMip, positionLod, posScale, networkInputs);
+
+    uint h0[NTC_MLP_HIDDEN0_CHANNELS / 4];
+    NtcLayer0(_NtcWeightOffsets.x, _NtcBiasOffsets.x, _NtcScaleOffsets.x, linearThreadIndex, networkInputs, h0);
+
+    uint h1[NTC_MLP_HIDDEN1_CHANNELS / 4];
+    NtcLayer1(_NtcWeightOffsets.y, _NtcBiasOffsets.y, _NtcScaleOffsets.y, linearThreadIndex, h0, h1);
+
+    uint h2[NTC_MLP_HIDDEN2_CHANNELS / 4];
+    NtcLayer2(_NtcWeightOffsets.z, _NtcBiasOffsets.z, _NtcScaleOffsets.z, linearThreadIndex, h1, h2);
+
+    uint outputs[NTC_MLP_OUTPUT_CHANNELS];
+    NtcLayer3(_NtcWeightOffsets.w, _NtcBiasOffsets.w, _NtcScaleOffsets.w, linearThreadIndex, h2, outputs);
+
+    // Cull texels outside the requested source rectangle (after the barriers above).
+    if (pixelPosition.x < _SrcRect.x || pixelPosition.y < _SrcRect.y ||
+        pixelPosition.x >= _SrcRect.z || pixelPosition.y >= _SrcRect.w)
+        return;
+
+    int2 dstPosition = pixelPosition + int2(_DstOffset.x, _DstOffset.y);
+
+    // ---- Vertical-flip correction for the OUTPUT write position only ----
+    // `pixelPosition`/`uv` above are in the RAW raster convention that ntc-cli trained
+    // against (row 0 = top of the source PNG), and everything upstream (latent grid UV,
+    // positional encoding) must stay in that convention for the MLP inputs to be correct
+    // -- so we deliberately do NOT touch pixelPosition/uv.
+    // But the destination is a plain RenderTexture written directly via this UAV (no Unity
+    // asset-import step), so it has NO import-time vertical flip applied. Unity's normal
+    // Texture2D import DOES flip PNG rows so that mesh UV.y=0 addresses the bottom of the
+    // visual image (matching common 3D content V-origin convention), which is what every
+    // "Original" material's imported textures (and the legacy on-Load PNG path, via
+    // Texture2D.LoadImage) already do. Without this correction here, on-Load(compute)/
+    // on-Sample(streamed) output would be stored top-down (unflipped) while everything else
+    // in the scene is bottom-up (flipped), producing a vertical mismatch that reads as the
+    // decoded texture being shifted/misaligned relative to the mesh's UVs.
+    // Assumption (true for every call site today): the destination target's full height
+    // equals mipSize.y, i.e. _DstOffset is always (0,0) -- DecompressFull and the tile
+    // streamer both pass dstTopLeft == srcRect.min.
+    int2 outPosition = int2(dstPosition.x, mipSize.y - 1 - dstPosition.y);
+
+    if (_OutputEnable.x != 0)
+    {
+        float r = ChannelValue(outputs, _ColorChannels.x);
+        float g = ChannelValue(outputs, _ColorChannels.y);
+        float b = ChannelValue(outputs, _ColorChannels.z);
+        if (_ColorChannels.w != 0) // stored sRGB -> linear (target RT is linear)
+        {
+            r = NtcSrgbToLinear(r);
+            g = NtcSrgbToLinear(g);
+            b = NtcSrgbToLinear(b);
+        }
+        // Alpha-test cutout mask: when the .ntc was baked with an Alpha/AlphaMask channel
+        // (see NtcBakeWindow.AddAlphaCutoutFromBaseMap), write the real per-pixel value here
+        // instead of hardcoding 1.0. This is what URP Lit's alpha-clip
+        // (BaseColor.a < _Cutoff -> discard) actually tests against; without it, on-Load/
+        // on-Sample billboard vegetation (Ivy, Vase_Round_Plants, ...) always evaluated
+        // alpha=1 and never got clipped, exposing the full quad. Materials baked without an
+        // Alpha channel (_AlphaChannel < 0) keep the original alpha=1.0 behavior.
+        float a = _AlphaChannel >= 0 ? ChannelValue(outputs, _AlphaChannel) : 1.0;
+        _OutBaseColor[outPosition] = float4(r, g, b, a);
+    }
+
+    if (_OutputEnable.y != 0)
+    {
+        float nx = ChannelValue(outputs, _NormalChannels.x);
+        float ny = ChannelValue(outputs, _NormalChannels.y);
+        float nz = _NormalChannels.z >= 0 ? ChannelValue(outputs, _NormalChannels.z) : 1.0;
+        // Same layout the on-Load PNG path used (X in R, Y in G, A=1), decoded by URP's
+        // UnpackNormalmapRGorAG (x *= a; a=1 leaves it untouched, Z reconstructed from x,y).
+        _OutNormal[outPosition] = float4(nx, ny, nz, 1.0);
+    }
+
+    if (_OutputEnable.z != 0)
+    {
+        float metal  = ChannelValue(outputs, _MaskChannels.x);
+        float smooth  = ChannelValue(outputs, _MaskChannels.y);
+        if (_MaskChannels.z != 0) // channel stores roughness -> convert to smoothness
+            smooth = 1.0 - smooth;
+        // URP _MetallicGlossMap: metallic in R, smoothness in A.
+        _OutMask[outPosition] = float4(metal, 0.0, 0.0, smooth);
+    }
+
+    if (_OutputEnable.w != 0)
+    {
+        float ao = ChannelValue(outputs, _AOChannel);
+        _OutAO[outPosition] = float4(ao, ao, ao, 1.0); // URP occlusion reads .g
+    }
+}

@@ -1,0 +1,89 @@
+# ============================================================================
+# NTCinUnity .gitignore
+#
+# 本仓库只跟踪「可分发的插件源码 + 文档」。三类大体积/第三方内容被显式排除，
+# 原因见下方注释——它们要么是上游仓库、要么是第三方美术资产、要么是可再生的
+# 烘焙产物，且都包含超过 GitHub 100MB 单文件硬限制的文件。
+# ============================================================================
+
+# --- NVIDIA 上游 SDK（约 2.7 GB，且自带独立 .git） ---------------------------
+# nvidia-backend/ 是 NVIDIA-RTX/RTXNTC 的克隆，包含 892MB 的 git pack 与多个
+# 70-80MB 的 DLSS DLL。它应当作为外部依赖单独 clone，而不是 vendored 进本仓库。
+#   获取方式：git clone https://github.com/NVIDIA-RTX/RTXNTC
+nvidia-backend/
+
+# --- Unity 示例工程（约 3.2 GB，含第三方美术资产） ---------------------------
+# unity-showcase/ 是 Classic-Sponza 的副本，美术资产属第三方授权，且Library/
+# 下有 119MB 的 burst dylib、Art/ 下有 80MB 的 .psd。示例工程不随插件分发。
+unity-showcase/
+
+# --- 烘焙产物（约 372 MB，可再生） -------------------------------------------
+# .ntc 是ntc-cli 的压缩输出，Decompressed/ 是解压预览 PNG。二者都可以用
+# NtcBakeWindow 从源贴图重新烘焙，不需要进版本库。
+unity-plugin/NtcData/
+!unity-plugin/NtcData.meta
+
+# ============================================================================
+# Unity 标准忽略项（若日后把示例工程纳入仓库时生效）
+# ============================================================================
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# Unity 自动生成的工程文件
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+
+# 崩溃/性能报告
+sysinfo.txt
+crashlytics-build.properties
+*.stackdump
+
+# ============================================================================
+# 编辑器 / 操作系统
+# ============================================================================
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ============================================================================
+# 常见大文件类型（防止误提交超过 GitHub 100MB 限制的二进制）
+# ============================================================================
+*.psd
+*.psb
+*.tif
+*.tiff
+*.exr
+*.dll
+*.exe
+*.pdb
+*.lib
+*.so
+*.dylib
+*.zip
+*.7z
+*.rar
