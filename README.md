@@ -1,159 +1,155 @@
-# NTCinUnity
+# NTCinUnity — NVIDIA Neural Texture Compression Unity Toolkit
 
-NTCinUnity 是一套 Unity 侧的 NVIDIA Neural Texture Compression（NTC）接入实验。项目包含 NVIDIA 官方 RTXNTC 后端、Unity 插件，以及对实际实现和验证结果的记录。
+本仓库围绕 **NVIDIA Neural Texture Compression（NTC）在 Unity URP 中的接入**，包含两部分：
 
-目标不是重新实现 NTC 的训练算法，而是打通下面这条链路：
+1. **[`nvidia-backend/`](nvidia-backend/)**：NVIDIA RTXNTC 官方仓库，以 Git submodule 固定上游版本，提供离线压缩工具 `ntc-cli`
+2. **[`unity-plugin/`](unity-plugin/)**：Unity 侧的材质烘焙、NTEX 容器解析、GPU 解压、PBR 材质绑定和 tile cache
 
-```text
-Unity 材质与源贴图
-    -> Editor 烘焙窗口调用 ntc-cli
-    -> .ntc（NTEX 容器）
-    -> Unity 纯 C# 解析
-    -> latent / MLP 权重上传 GPU
-    -> compute 解压或分块缓存
-    -> 绑定回 URP 材质
-```
+如果你只是想**安装和使用**插件，详见 **[`docs/使用说明.md`](docs/使用说明.md)**。
 
-## 仓库内容
+如果你想了解 **NTEX 数据布局、MLP 推理、GPU 资源组织和工程限制**，见
+**[`docs/技术报告.md`](docs/技术报告.md)** 与 [`docs/验证记录.md`](docs/验证记录.md)。
 
-```text
-NTCinUnity/
-├─ nvidia-backend/   NVIDIA RTXNTC 官方仓库（Git submodule）
-├─ unity-plugin/     Unity 插件源码
-├─ docs/             技术报告、使用与验证记录
-├─ LICENSE
-└─ THIRD-PARTY-NOTICES.md
-```
+---
 
-`nvidia-backend` 是指向 NVIDIA 官方仓库的 submodule，用于固定上游版本并保持许可证边界。
+## 方案总览与对比
 
-克隆时需要带子模块：
+插件覆盖离线烘焙和三种运行模式。`ntc-cli` 只参与离线压缩；Unity Runtime 不链接 `libntc.dll`，也不依赖 CUDA 或 `ntc-cli.exe`。
+
+### 运行模式
+
+| 模式 | GPU 路径 | 输出资源 | 定位 |
+| --- | --- | --- | --- |
+| **Original** | 不执行 NTC 推理 | 场景原始贴图 | 画面对照 |
+| **Inference on Load** | Compute Shader 整图解压 | 完整 PBR RenderTexture | 质量验证与常规运行路径 |
+| **Inference on Sample** | Compute Shader 分帧解压 tile | 受分辨率上限约束的 PBR cache | 可见材质优先、降低单帧解压开销 |
+| Fragment MLP fallback | Fragment Shader 直接执行 MLP | BaseColor-only Unlit 输出 | Compute/tile 路径的兼容性回退 |
+
+### 核心组件
+
+| 组件 | 职责 | 实现 |
+| --- | --- | --- |
+| `NtcBakeWindow` | 扫描 Unity 材质、生成 manifest、调用 `ntc-cli` | Unity Editor |
+| `NtcContainerReader` | 读取 NTEX Header、JSON Chunk 和 Data Chunk | 纯 C# |
+| `NtcAssetBuilder` | 构建 latent `Texture2DArray` 与 INT8 网络参数 | Unity Runtime |
+| `NtcDecompressor` | 执行整图或指定区域的 MLP 解压 | Compute Shader |
+| `NtcTileStreamer` | 按可见性、距离和每帧预算填充 PBR cache | Unity Runtime |
+| `NtcSceneController` | 扫描场景、切换模式、绑定 URP 材质 | Unity Runtime |
+
+测试文件使用 `48 -> 64 -> 48 -> 32 -> 16` 的 INT8 MLP，隐藏层激活函数为 HGELUClamp。
+
+完整的数据流、通道映射和实现约束见
+**[`docs/技术报告.md`](docs/技术报告.md)**。
+
+---
+
+## 快速开始
+
+克隆仓库并初始化 NVIDIA RTXNTC 子模块：
 
 ```bash
 git clone --recursive https://github.com/kiiye9697/NTCinUnity.git
 ```
 
-已经克隆过主仓库的话：
+将 `unity-plugin/` 复制到 Unity 工程：
 
-```bash
-git submodule update --init --recursive
+```text
+Assets/NtcPlugin/
 ```
 
-## 实现
-
-### Editor 烘焙
-
-`unity-plugin/Editor/NtcBakeWindow.cs` 会扫描场景或项目材质，提取 BaseColor、Normal、AO、Metallic、Smoothness 和 Alpha Cutout 数据，生成 manifest，然后以外部进程调用 `ntc-cli`。
-
-默认设置：
-
-- 16 bpp，界面上限 20 bpp；
-- Metalness loss scale 24；
-- Smoothness/Roughness loss scale 16；
-- 强制 `--gdeflate off`，因为 Unity 运行时没有实现 GDeflate 解码。
-
-`ntc-cli` 属于离线烘焙工具。它不参与 Unity Player 的运行时逻辑，也不会被 `Editor/` 目录中的代码带进 Player。
-
-### Unity Runtime
-
-Runtime 不链接 `libntc.dll`，也不调用 CUDA。核心路径是：
-
-1. `NtcContainerReader` 读取 NTEX Header、JSON Chunk 和 Data Chunk；
-2. `NtcAssetBuilder` 把 latent 展开为 `Texture2DArray`，把 INT8 网络参数上传为 Raw `ComputeBuffer`；
-3. `NtcDecompressor` 用 compute shader 执行 MLP；
-4. `NtcSceneController` 负责材质扫描、模式切换和 PBR 贴图绑定；
-5. `NtcTileStreamer` 在 on-Sample 模式下按材质可见性和距离分帧填充缓存。
-
-网络拓扑来自 `.ntc` 数据：`48 -> 64 -> 48 -> 32 -> 16`，隐藏层使用 HGELUClamp。
-
-## 三种模式
-
-### Original
-
-恢复场景原始材质和贴图，作为画面对照。
-
-### Inference on Load
-
-进入模式时将整套 `.ntc` 解压到普通 PBR RenderTexture，再绑定回原材质。默认使用 compute shader；compute 不可用或失败时，可以退回到预先解压的 PNG。
-
-### Inference on Sample
-
-on-Sample 默认使用 **tile cache**，不在 fragment shader 中每帧逐像素执行 MLP：
-
-- 只处理当前可见材质；
-- 近处材质优先；
-- 默认每块 `256 x 256`；
-- 缓存最长边默认限制为 1024；
-- 每帧最多调度 8 个 tile；
-- 材质不可见 5 秒后释放整张缓存。
-
-MLP 在 tile 解压阶段执行，最终 URP 材质采样的是缓存 RenderTexture。工程还保留了一个直接在 fragment 中执行 MLP 的回退 shader，但该路径只输出 BaseColor，属于 Unlit 验证路径，不代表完整 PBR 的默认实现。
-
-## 使用
-
-### 1. 准备插件
-
-把 `unity-plugin/` 复制到 Unity 工程的 `Assets/NtcPlugin/`。验证环境为 Unity 2021.3 + URP。
-
-### 2. 准备 ntc-cli
-
-按照 `nvidia-backend/README.md` 构建 RTXNTC。烘焙窗口中的 `ntc-cli` 字段可以直接填写编译产物路径。
-
-### 3. 烘焙
-
-在 Unity 中打开：
+按照 [`nvidia-backend/README.md`](nvidia-backend/README.md) 构建 `ntc-cli`，然后在 Unity 中完成烘焙：
 
 ```text
 NTC / Bake Window
+    -> 选择 ntc-cli.exe
+    -> Scan Scene Materials
+    -> Bake All Selected
 ```
 
-扫描材质、选择要处理的条目，然后执行批量烘焙。默认输出目录为：
+默认输出：
 
 ```text
-Assets/NtcPlugin/NtcData/
+Assets/NtcPlugin/NtcData/{MaterialName}.ntc
 ```
 
-生成文件名通常是 `{MaterialName}.ntc`。
-
-### 4. 运行
-
-通过菜单创建控制器：
+创建场景控制器并进入 Play：
 
 ```text
 NTC / Add Scene Controller
 ```
 
-进入 Play 后，通过左上角面板切换 Original、on-Load 和 on-Sample；`F1` 可以隐藏面板。控制器默认在 `NtcPlugin/NtcData` 下按材质名查找 `.ntc`。
+左上角面板用于切换 `Original`、`on-Load`、`on-Sample` 和 PBR 通道检查；`F1` 控制面板显隐。
 
-## 功能范围
+验证环境为 **Unity 2021.3 + URP**。详细参数和排错流程见
+[`docs/使用说明.md`](docs/使用说明.md)。
 
-- `NtcSceneController` 使用 `Application.dataPath` 读取 Editor 工程中的 `.ntc`；
-- Player 数据由宿主工程通过 StreamingAssets、Addressables 或自定义导入器提供；
-- 场景扫描读取 Renderer 的第一个 `sharedMaterial`；
-- 材质通道按贴图名称识别；
-- 渲染集成面向 URP；
-- on-Sample 分配 PBR tile cache，显存统计包含 latent、权重、cache 和 mip 链；
-- GDeflate BufferView 不受支持，烘焙使用 `--gdeflate off`。
+---
 
-## 验证数据
+## Unity 插件（`unity-plugin/`）
+
+`unity-plugin/` 是 Unity 侧的完整接入代码，包含 Runtime、Editor 工具和 GPU shader。
+
+```text
+unity-plugin/
+├── Runtime/
+│   ├── NtcContainerReader.cs      # NTEX 容器解析
+│   ├── NtcJson.cs                 # 零依赖 JSON 解析
+│   ├── NtcAssetBuilder.cs         # latent 与网络参数构建
+│   ├── NtcDecompressor.cs         # Compute Shader 解压调度
+│   ├── NtcTileStreamer.cs         # tile cache 调度与驱逐
+│   ├── NtcSceneController.cs      # 场景扫描、模式切换与材质绑定
+│   └── NtcPackingReport.cs        # 容器结构报告
+├── Editor/
+│   ├── NtcBakeWindow.cs           # 材质扫描与批量烘焙
+│   ├── NtcSetupMenu.cs            # Unity 菜单入口
+│   └── NtcSceneControllerEditor.cs
+├── Shaders/
+│   ├── NtcInference.hlsl          # INT8 MLP 推理
+│   ├── NtcInferenceOnSample_URP.shader
+│   └── PBRChannelDebug_URP.shader
+└── Resources/
+    └── NtcDecompress.compute      # 整图与区域解压 kernel
+```
+
+默认烘焙参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | ---: | --- |
+| Bits per pixel | 16 | UI 支持 1–20 bpp |
+| Metalness loss scale | 24 | 保留近二值金属遮罩的对比度 |
+| Smoothness/Roughness loss scale | 16 | 降低光滑度通道的细节损失 |
+| GDeflate | off | Runtime 不解码 GDeflate BufferView |
+| Tile size | 256 | on-Sample 分块尺寸 |
+| Cache max dimension | 1024 | on-Sample cache 最长边 |
+| Tiles per frame | 8 | 每帧解压预算 |
+| Eviction delay | 5 s | 不可见材质缓存释放延迟 |
+
+Player 工程需要通过 StreamingAssets、Addressables 或自定义导入器提供 `.ntc` 数据；默认路径实现面向 Unity Editor 的 `Assets/NtcPlugin/NtcData`。
+
+---
+
+## 验证结果
 
 | 测试对象 | 指标 | 结果 |
-|---|---|---:|
-| MetalPlates013 | 解压图对源图 overall PSNR | **45.26 dB** |
+| --- | --- | ---: |
+| MetalPlates013 | 解压结果对源图 overall PSNR | **45.26 dB** |
 | SponzaBricks | 单材质 `ntc-cli` 训练 PSNR | **51.37 dB** |
-| NTEX 测试集 | C# 容器解析 | **7/7 files** |
+| NTEX 测试集 | C# 容器解析 | **7 / 7 files** |
+| Flagpoles Metalness | loss scale 24 后解压均值 | **201.80**（源图 201.84） |
 
-详细测试方法见 [`docs/验证记录.md`](docs/验证记录.md)。
+`51.37 dB` 是单材质训练指标；`45.26 dB` 是解压图与源图的外部逐像素测量。测试方法、通道统计和数据布局验证见
+[`docs/验证记录.md`](docs/验证记录.md)。
 
-## 文档
+---
 
-- [`docs/技术报告.md`](docs/技术报告.md)：系统架构、数据流、关键设计和功能限制；
-- [`docs/使用说明.md`](docs/使用说明.md)：安装、烘焙、运行和排错；
-- [`docs/验证记录.md`](docs/验证记录.md)：保留下来的可复现数据和问题修复依据；
-- [`docs/README.md`](docs/README.md)：文档索引。
+## License
 
-## 许可证
+本仓库采用 **NTCinUnity Research and Evaluation License**，见 [`LICENSE`](LICENSE)。
 
-仓库不是 MIT、Apache-2.0 等开源许可证项目。Unity 插件中的两个 shader 文件移植了 NVIDIA RTXNTC SDK 的推理数学，受 NVIDIA RTX SDKs License Agreement 约束。本仓库使用研究与评估许可，具体边界见 [`LICENSE`](LICENSE) 和 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
+`nvidia-backend/` 由 NVIDIA RTXNTC 自身许可证管理。`NtcInference.hlsl` 与 `NtcDecompress.compute` 中的 NVIDIA 衍生部分同样受 NVIDIA 条款约束，归属和文件边界见 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
 
-`nvidia-backend/` 作为官方 submodule 使用 NVIDIA 自己的许可证，本仓库的 `LICENSE` 不覆盖该子模块。
+## 致谢
+
+- NVIDIA RTXNTC / LibNTC — NTC 压缩工具、容器格式与推理参考实现
+- Vaidyanathan et al. *Random-Access Neural Compression of Material Textures.* SIGGRAPH 2023
+- Unity Universal Render Pipeline — PBR 材质与渲染集成环境
