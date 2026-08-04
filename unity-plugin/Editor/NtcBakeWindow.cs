@@ -73,7 +73,7 @@ namespace Ntc.UnityEditorTools
             // (NtcAssetBuilder.BuildPbrLayout keys off the texture's *name* field, "Smoothness", not
             // its semantics), but it is wrong metadata that would mislead any other manifest/semantic
             // consumer (e.g. NVIDIA's Explorer tool) into treating smoothness values as roughness
-            // (visually inverted shininess). See PROGRESS.md 2026-07-09 entry.
+            // (visually inverted shininess). See docs/验证记录.md 2026-07-09 entry.
             new TextureSpec("Smoothness", "Smoothness", false, "BC4", "Glossiness", "R"),
             // Alpha/cutout mask, extracted from the SAME source file as Diffuse (its alpha
             // channel), not a separate "*_Alpha.tif" convention file -- see
@@ -81,7 +81,7 @@ namespace Ntc.UnityEditorTools
             // label (docs/SettingsAndQuality.md): NTC preserves 0.0/1.0 with extra accuracy for
             // whichever texture declares this semantic, which is exactly what a binary/soft
             // alpha-test edge (billboard vegetation, Ivy, Vase_Round_Plants, ...) needs. Fixes
-            // the "exposed billboard rectangle" bug (PROGRESS.md 2026-07-06 entry): the BaseColor
+            // the "exposed billboard rectangle" bug (docs/验证记录.md 2026-07-06 entry): the BaseColor
             // RT's alpha was hardcoded to 1.0 end-to-end because no stage of the pipeline ever
             // captured/transmitted the source alpha channel.
             new TextureSpec("Alpha",      "Alpha",      false, "BC4", "AlphaMask", "A"),
@@ -325,7 +325,7 @@ namespace Ntc.UnityEditorTools
             // materials that still need a first bake, or only the ones that already
             // have a .ntc and would be REBAKED (e.g. after changing loss-scale sliders
             // or the texture map, to force existing files to regenerate instead of
-            // silently keeping stale data -- see PROGRESS.md 2026-07-10 batch script bug).
+            // silently keeping stale data -- see docs/验证记录.md 2026-07-10 batch script bug).
             if (GUILayout.Button("Select Unbaked", GUILayout.Width(104)))
                 foreach (MaterialEntry e in _entries) e.selected = !e.hasNtc;
             if (GUILayout.Button("Select Baked (Rebake)", GUILayout.Width(148)))
@@ -401,7 +401,7 @@ namespace Ntc.UnityEditorTools
             // Alpha-test cutout mask (billboard vegetation, Ivy, Vase_Round_Plants, ...): pull
             // the alpha channel of the SAME BaseMap/MainTex source image (not a separate file)
             // as its own scalar NTC texture. See AddAlphaCutoutFromBaseMap for why this is
-            // gated on the material actually alpha-testing, and PROGRESS.md 2026-07-06/07-13
+            // gated on the material actually alpha-testing, and docs/验证记录.md 2026-07-06/07-13
             // entries for the bug this fixes.
             AddAlphaCutoutFromBaseMap(mat, entry, "_BaseMap");
             if (entry.textures.Exists(t => t.outName == "Alpha") == false)

@@ -1330,49 +1330,10 @@ namespace Ntc.Unity
 
         static string MB(long bytes) { return (bytes / (1024.0 * 1024.0)).ToString("0.00") + " MB"; }
 
-        // Resolves a data path such as "NtcPlugin/NtcData" to an absolute directory.
-        //
-        // Editor and player disagree about where loose files live, and .ntc is not a type Unity
-        // imports, so a .ntc only survives into a build if it sits under StreamingAssets. Rather
-        // than force the user to reconfigure the path per target, try the plausible locations in
-        // order and take the first that exists. The same serialized path then works in the editor
-        // (files under Assets/) and in a player (files copied to StreamingAssets).
         static string ToAbsolute(string assetsRelative)
         {
-            string streaming = Application.streamingAssetsPath.Replace('\\', '/');
-            if (string.IsNullOrEmpty(assetsRelative)) return streaming;
             if (Path.IsPathRooted(assetsRelative)) return assetsRelative;
-
-            string rel = assetsRelative.Replace('\\', '/').Trim('/');
-            int slash = rel.LastIndexOf('/');
-            string leaf = slash >= 0 ? rel.Substring(slash + 1) : rel;
-
-            string[] candidates =
-            {
-#if UNITY_EDITOR
-                // The bake window writes straight into Assets/<rel>.
-                Path.Combine(Application.dataPath, rel),
-#endif
-                // A player onlyever sees StreamingAssets: either the folder was copied with its
-                // full relative path, or just its leaf ("NtcData"), or the files sit at the root.
-                Path.Combine(streaming, rel),
-                Path.Combine(streaming, leaf),
-                streaming,
-            };
-
-            foreach (string c in candidates)
-            {
-                string p = c.Replace('\\', '/');
-                if (Directory.Exists(p)) return p;
-            }
-
-            // Nothing exists yet. Return the location this platform is supposed to use so the
-            // "not baked" message points somewhere useful.
-#if UNITY_EDITOR
-            return Path.Combine(Application.dataPath, rel).Replace('\\', '/');
-#else
-            return Path.Combine(streaming, leaf).Replace('\\', '/');
-#endif
+            return Path.Combine(Application.dataPath, assetsRelative).Replace('\\', '/');
         }
 
         static string MakeRelative(string absPath)

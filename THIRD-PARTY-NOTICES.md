@@ -1,106 +1,58 @@
-Third-Party Notices
-===================
+# Third-Party Notices
 
-This file records third-party material this project depends on or derives from,
-and the obligations attached to each. Read it before redistributing anything from
-this repository.
+This document identifies third-party material referenced by or used to develop NTCinUnity. The repository-level `LICENSE` applies only to original NTCinUnity material.
 
+## NVIDIA RTXNTC
 
-1. NVIDIA RTXNTC SDK / LibNTC
------------------------------
+- Upstream: <https://github.com/NVIDIA-RTX/RTXNTC>
+- Local path: `nvidia-backend/`
+- Integration: Git submodule pointing to NVIDIA's official repository
+- Governing terms: the license files in the RTXNTC repository
 
-**Upstream:** https://github.com/NVIDIA-RTX/RTXNTC
-**License:** NVIDIA RTX SDKs License Agreement
-**SPDX marker used by NVIDIA:** `LicenseRef-NvidiaProprietary`
-**Copyright:** Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+The parent repository stores only the submodule reference. A recursive clone fetches RTXNTC directly from NVIDIA. Local RTXNTC build output, downloaded SDKs, binaries, and uncommitted modifications are not part of the parent repository.
 
-### Required notice
+### NVIDIA-derived shader code
 
-NVIDIA's license requires the following statement to appear in modifications and
-derivative works of its source code, and it is reproduced here and in the headers
-of the affected files:
+The following NTCinUnity files contain Unity ports of RTXNTC inference/decompression logic:
+
+| NTCinUnity file | NVIDIA source used as reference |
+|---|---|
+| `unity-plugin/Shaders/NtcInference.hlsl` | `Inference.hlsli` |
+| `unity-plugin/Resources/NtcDecompress.compute` | `DecompressINT8.hlsl`, `Inference.hlsli` |
+
+NVIDIA marks the relevant upstream shader source with `SPDX-License-Identifier: LicenseRef-NvidiaProprietary`. The NVIDIA-derived portions of the two files above remain governed by NVIDIA's terms, not by the repository-level `LICENSE`.
+
+The attribution required by the NVIDIA license is reproduced in those files and here:
 
 > This software contains source code provided by NVIDIA Corporation.
 
-### Files in this repository derived from the SDK
+The rest of the Unity-specific code includes resource binding, NTEX parsing, GPU asset construction, URP material integration, Editor tooling, and tile scheduling written for this project.
 
-| File | Derived from | Nature of the derivation |
-|------|--------------|--------------------------|
-| `unity-plugin/Shaders/NtcInference.hlsl` | `Inference.hlsli` | Port of the MLP inference math (weight decode, layer evaluation, HGELUClamp activation, latent sampling) to plain HLSL for Unity |
-| `unity-plugin/Resources/NtcDecompress.compute` | `DecompressINT8.hlsl`, `Inference.hlsli` | Port of the same math into a Unity compute kernel, with Unity-specific resource binding, a groupshared weight cache, and a software int8 dot-product fallback |
+## Unity and Universal Render Pipeline
 
-These two files are governed by **NVIDIA's license, not by this repository's
-LICENSE**. Each carries an attribution header saying so.
+The plugin targets Unity 2021.3 and the Universal Render Pipeline. Unity is used under the Unity Software Terms accepted when installing and using the editor. No Unity engine or URP source is copied into this repository.
 
-### Why this repository is not open source
+## Classic Sponza development scene
 
-The NVIDIA RTX SDKs License Agreement states, in section 4(e), that the licensee
-may not use the SDK in any manner that would cause it to become subject to an
-open source software license — specifically a license requiring that the software
-be disclosed or distributed in source form, licensed for making derivative works,
-or redistributable at no charge.
+The local development showcase uses Unity's Classic Sponza sample, derived from the Crytek Sponza model. That scene is used only for local validation.
 
-Because the two shader files above are derivative works of SDK source code,
-placing this repository under MIT, Apache-2.0, or a similar license would breach
-that clause. That is the reason for the research-and-evaluation terms in LICENSE.
+The public repository does not include:
 
-### What this repository does *not* contain
+- the showcase Unity project;
+- Classic Sponza meshes or textures;
+- HDR environment assets used by the local project;
+- `.ntc` files baked from those textures;
+- decompressed preview images derived from those textures;
+- the compiled showcase Player.
 
-No NVIDIA source, header, binary, or SDK archive is redistributed here. In
-particular `ntc-cli.exe` and `libntc` are **not** included. To bake your own
-`.ntc` files, clone the SDK from the upstream URL above and build it yourself,
-accepting NVIDIA's license at that point.
+Measurements in `docs/验证记录.md` are numerical observations only and do not include asset data.
 
-### Interoperability note
+## Summary
 
-`unity-plugin/Runtime/NtcContainerReader.cs` parses the NTEX container layout
-(header, JSON chunk, data chunk). It was written from observed file structure and
-the SDK's public documentation for interoperability purposes and contains no
-NVIDIA source code.
-
-
-2. Unity "Classic Sponza" sample scene
---------------------------------------
-
-The scene used during development (`Sponza_Showcase`) and its textures come from
-Unity Technologies' Classic Sponza sample, which itself derives from Crytek's
-Sponza model. No license grant accompanied the copy used here.
-
-Consequences, and how this repository handles them:
-
-* The scene and its art are **not** included in this repository.
-* Compressed `.ntc` files baked from those textures are derivative works of that
-  art, so they are **not** included either. `.gitignore` excludes them.
-* Quality figures quoted in the documentation (PSNR per material, VRAM
-  comparisons) are measurements only and contain no asset data.
-
-If you want to reproduce the measurements, obtain Classic Sponza from Unity under
-Unity's terms and bake it yourself with the included bake window.
-
-
-3. NoEmotion HDRs (development only)
-------------------------------------
-
-The development project's sky uses HDR panoramas from NoEmotion HDRs, covered by
-`NoEmotionHDRs-License.txt` in that project. Those files live only in the local
-development project and are not part of this repository.
-
-
-4. Unity Engine and Universal Render Pipeline
----------------------------------------------
-
-This plugin is written against Unity 2021.3 and URP, used under the Unity
-Software Terms accepted when installing the editor. No Unity engine code is
-redistributed here.
-
-
-Summary
--------
-
-| Component | Redistributed here? | Governing terms |
-|-----------|--------------------|-----------------|
-| Our plugin code (container reader, asset builder, controller, tile streamer, bake tools, editor UI) | Yes | LICENSE in this repository |
-| NVIDIA-derived shader math (2 files) | Yes, as derivative source | NVIDIA RTX SDKs License Agreement |
-| NVIDIA SDK / `ntc-cli` binaries | No | Obtain from NVIDIA |
-| Classic Sponza art and `.ntc` baked from it | No | Obtain from Unity |
-| NoEmotion HDR skies | No | NoEmotion HDRs license |
+| Component | Included | Terms |
+|---|---|---|
+| Original Unity plugin C# and Editor code | Yes | Repository `LICENSE` |
+| NVIDIA-derived portions of two shader files | Yes | NVIDIA RTXNTC terms and file attribution |
+| RTXNTC source | Referenced as official submodule | RTXNTC repository license |
+| Local RTXNTC build output and binaries | No | Not distributed |
+| Local Classic Sponza showcase and baked data | No | Not distributed |

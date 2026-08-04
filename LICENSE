@@ -1,73 +1,64 @@
-NTCinUnity — Research and Evaluation License
-============================================
+NTCinUnity Research and Evaluation License
+=========================================
 
 Copyright (c) 2026 kiiye9697
 
-This repository is published for research, study, and technical evaluation.
+This license applies to the original NTCinUnity material in this repository. It
+does not replace or modify the licenses of third-party components, including the
+NVIDIA RTXNTC submodule and NVIDIA-derived shader portions identified in
+THIRD-PARTY-NOTICES.md.
 
-It is **not** open source software. No open source license is granted. The
-permissions below are deliberately narrow, and that is not an oversight: part of
-this work is derived from the NVIDIA RTXNTC SDK, and NVIDIA's license for that
-SDK explicitly forbids placing it under a license that would require source
-disclosure or free redistribution. Applying MIT, Apache-2.0, or any similar
-license to this repository would violate those terms. See THIRD-PARTY-NOTICES.md
-for the details and for the files affected.
+1. Permission
+-------------
 
-
-1. Grant
---------
-
-Subject to the restrictions in section 2, you may, at no charge:
-
-  a. download, read, and study this repository;
-  b. build and run it for internal research, teaching, benchmarking, or
-     technical evaluation;
-  c. modify it for those same purposes.
-
+You may download, build, run, study, and modify the original NTCinUnity material
+for non-commercial research, education, benchmarking, and technical evaluation.
 
 2. Restrictions
 ---------------
 
-You may not:
+Unless you have prior written permission from the copyright holder, you may not:
 
-  a. redistribute this repository, or any derivative of it, in source or binary
-     form, without prior written permission from the copyright holder;
-  b. use it, in whole or in part, in a commercial product or service;
-  c. remove or alter any copyright, attribution, or license notice, including the
-     NVIDIA notices described in THIRD-PARTY-NOTICES.md and reproduced in the
-     headers of the affected shader files;
-  d. sublicense or re-license any part of it, in particular under an open source
-     license.
+  a. use the original NTCinUnity material in a commercial product or service;
+  b. redistribute the original NTCinUnity material, or a derivative of it, in
+     source or binary form;
+  c. sublicense or relicense it;
+  d. remove copyright, attribution, or license notices.
 
+3. NVIDIA RTXNTC
+----------------
 
-3. Third-party components
--------------------------
+The directory `nvidia-backend/` is a Git submodule that points to NVIDIA's
+official RTXNTC repository. It is a separate work governed by the license in that
+repository. This license does not apply to it.
 
-Portions of the shader code in this repository are derived from the NVIDIA RTXNTC
-SDK. Those portions are governed by NVIDIA's license, not by this file. You must
-obtain the SDK from NVIDIA and accept NVIDIA's terms separately. The affected
-files carry an attribution header identifying them.
+Parts of these files are derived from NVIDIA RTXNTC shader code:
 
-This repository does not redistribute the NVIDIA SDK, the `ntc-cli` executable,
-or any NVIDIA binary.
+  unity-plugin/Shaders/NtcInference.hlsl
+  unity-plugin/Resources/NtcDecompress.compute
 
+The NVIDIA-derived portions are governed by NVIDIA's terms, not by this license.
+The files carry attribution headers, and THIRD-PARTY-NOTICES.md records their
+origin.
 
-4. No warranty
+4. Other third-party material
+-----------------------------
+
+Unity, the Universal Render Pipeline, Classic Sponza, and any local test assets
+remain subject to their respective terms. The public repository does not include
+the local Classic Sponza showcase or `.ntc` files baked from its textures.
+
+5. No warranty
 --------------
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+THE MATERIAL IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
-COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
-AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
-WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE MATERIAL OR ITS USE.
 
-
-5. Contact
+6. Contact
 ----------
 
-For any use beyond section 1, including commercial use or redistribution, open an
-issue at https://github.com/kiiye9697/NTCinUnity.
-
-This file is a statement of the terms under which the author publishes this code.
-It is not legal advice.
+For commercial use or redistribution permission, open an issue at:
+https://github.com/kiiye9697/NTCinUnity

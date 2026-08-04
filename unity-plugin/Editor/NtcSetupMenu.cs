@@ -60,52 +60,6 @@ namespace Ntc.UnityEditorTools
             NtcBakeWindow.ShowWindow();
         }
 
-        // .ntc has no Unity importer, so Unity treats it as an unknown asset and leaves it out of
-        // player builds. StreamingAssets is the one folder whose raw files are copied verbatim, so
-        // anything you want a build to load has to be mirrored there before building.
-        [MenuItem("NTC/Copy NtcData To StreamingAssets (for builds)", false, 11)]
-        public static void CopyNtcDataToStreamingAssets()
-        {
-            NtcSceneController ctrl = GameObject.FindObjectOfType<NtcSceneController>();
-            string rel = ctrl != null && !string.IsNullOrEmpty(ctrl.ntcDataPath)
-                ? ctrl.ntcDataPath
-                : "NtcPlugin/NtcData";
-
-            string src = System.IO.Path.Combine(Application.dataPath, rel).Replace('\\', '/');
-            if (!System.IO.Directory.Exists(src))
-            {
-                EditorUtility.DisplayDialog("NTC",
-                    "No baked data found at:\n" + src +
-                    "\n\nBake some materials first (NTC/Bake Window).", "OK");
-                return;
-            }
-
-            string[] files = System.IO.Directory.GetFiles(src, "*.ntc", System.IO.SearchOption.TopDirectoryOnly);
-            if (files.Length == 0)
-            {
-                EditorUtility.DisplayDialog("NTC", "No .ntc files in:\n" + src, "OK");
-                return;
-            }
-
-            // Mirror only the leaf folder name; ToAbsolute() looks for StreamingAssets/NtcData.
-            string leaf = System.IO.Path.GetFileName(src.TrimEnd('/'));
-            string dst = System.IO.Path.Combine(Application.streamingAssetsPath, leaf).Replace('\\', '/');
-            System.IO.Directory.CreateDirectory(dst);
-
-            long bytes = 0;
-            foreach (string f in files)
-            {
-                string target = System.IO.Path.Combine(dst, System.IO.Path.GetFileName(f));
-                System.IO.File.Copy(f, target, true);
-                bytes += new System.IO.FileInfo(f).Length;
-            }
-
-            AssetDatabase.Refresh();
-            Debug.Log("[NTC] Copied " + files.Length + " .ntc (" +
-                (bytes / (1024.0 * 1024.0)).ToString("0.0") + " MB) to " + dst +
-                ". These will now be included in player builds.");
-        }
-
         static void MarkDirty(GameObject go)
         {
             EditorUtility.SetDirty(go);

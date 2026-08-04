@@ -1,118 +1,168 @@
 # NTCinUnity
 
-把 NVIDIA 的神经纹理压缩（NTC）接到 Unity 里的一套插件。`.ntc` 容器用纯 C# 解析，解压跑在 compute shader 上，运行时不依赖 NVIDIA 的任何 DLL、也不需要 CUDA。
+NTCinUnity 是一套 Unity 侧的 NVIDIA Neural Texture Compression（NTC）接入实验。项目包含 NVIDIA 官方 RTXNTC 后端、Unity 插件，以及对实际实现和验证结果的记录。
 
-做这个项目的出发点是想搞清楚一件事：NTC 论文里那些好看的压缩率，在真实引擎、真实美术资产上还剩多少。所以它不是一个 demo 级的验证，而是把烘焙工具、三种接入模式、显存流送、打包链路都补齐了，踩过的坑也都记在文档里。
+目标不是重新实现 NTC 的训练算法，而是打通下面这条链路：
 
-实测结果：Classic-Sponza 全场景 7 个材质，PSNR 51.37 dB；on-Sample 模式相比常规贴图省下约 83% 显存。
-
-> 上游是 NVIDIA [RTXNTC / LibNTC 0.9.2](https://github.com/NVIDIA-RTX/RTXNTC)，论文为《Random-Access Neural Compression of Material Textures》(SIGGRAPH 2023)。本仓库不包含 NVIDIA 的任何源码或二进制，详见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
-
-## 三种接入模式
-
-插件的设计原则是「原有加载流程不动，只在取贴图那一刻注入 NTC」。据此有三种模式，运行时可随时切换：
-
-| 模式 | 做法 | 显存 |
-|------|------|------|
-| Original | 用工程原始贴图，什么都不改 | 原始贴图全量 |
-| Inference on Load | 加载时把 `.ntc` 整图解压成 RenderTexture，绑回原材质。shader 不用改 | 与原始相当 |
-| Inference on Sample | 按可见性和距离逐 tile 解压，封顶分辨率，超时驱逐 | 只驻留 latent + 权重 |
-
-这三个不是「哪个最好」的选择题，而是排查链路的三个阶段。先跑 Original 建立基线；切到 on-Load，因为它不动 shader，画面若和基线有差异就一定出在解压或通道映射；最后上 on-Sample，验证逐像素 MLP 推理。开发过程中这个顺序反复证明有效——遇到画面问题时，先问清楚「你对比的是哪两个模式」，比一头扎进代码里快得多。
-
-面板上还有一组通道隔离视图（Lit / Base / Normal / Metal / Rough），用来定位解码和通道映射问题。
-
-## 目录结构
-
-```
-unity-plugin/
-  Runtime/     容器解析、GPU 资产构建、compute 解压器、场景控制器、tile 流送
-  Editor/      烘焙窗口、Inspector 扩展、菜单
-  Shaders/     MLP 推理数学、on-Sample shader、通道调试 shader
-  Resources/   NtcDecompress.compute（放这里是为了保证进包）
-docs/          技术报告：论文精读、架构、烘焙工具链、踩坑实录
-PROGRESS.md    开发日志，按日期记录，技术细节最全的一份
+```text
+Unity 材质与源贴图
+    -> Editor 烘焙窗口调用 ntc-cli
+    -> .ntc（NTEX 容器）
+    -> Unity 纯 C# 解析
+    -> latent / MLP 权重上传 GPU
+    -> compute 解压或分块缓存
+    -> 绑定回 URP 材质
 ```
 
-插件不依赖任何示例工程，把 `unity-plugin/` 整个拷到目标工程的 `Assets/NtcPlugin/` 就能用。场景特化的硬编码已经清掉了，贴图源目录、`.ntc` 前缀、ntc-cli 路径都可配。
+## 仓库内容
 
-仓库里没有 `.ntc` 样例，也没有示例场景。原因是它们都是 Unity Classic-Sponza 那批美术资产的衍生物，没有随附授权，不适合放在公开仓库里。要复现测试数据的话，自己取得 Sponza 再烘一遍就行。
-
-## 上手
-
-需要 Unity 2021.3 或更高，URP。
-
-**准备 `.ntc`。** 烘焙依赖 NVIDIA 的 `ntc-cli.exe`，得自己去 clone [RTXNTC](https://github.com/NVIDIA-RTX/RTXNTC) 编译（需要 CUDA Toolkit）。编好之后开 `NTC / Bake Window`，点 `Scan Scene Materials`，勾上要烘的材质，`Bake All Selected`。窗口会自动去工程根目录、SDK 目录和 PATH 里找 `ntc-cli.exe`。
-
-**跑起来。** 菜单 `NTC / Add Scene Controller` 创建控制器，进 Play，左上角面板切模式，F1 收起面板。控制器会扫描场景材质，在 `ntcDataPath`（默认 `NtcPlugin/NtcData`）下按材质名匹配 `.ntc`。
-
-烘焙有两条硬约束，绕不过去：
-
-一是**必须 `--gdeflate off`**。运行时的容器解析是纯 C#，没有实现 GDeflate 解码，碰到压缩过的 BufferView 会直接抛异常。烘焙窗口已经默认带上了这个开关，列表里状态显示 `GDeflate: rebake` 的旧文件得重烤。
-
-二是**二值 mask 通道要单独给 loss 权重**。NTC 让一个材质的所有通道共享同一个 bpp 预算，Metallic、Alpha 这种接近二值的 mask 跟 Color、Normal 一起训练时会被压成常数。插件默认给 Metal 24 倍、Smooth 16 倍的 `lossFunctionScale`，这个参数不增加文件大小，只改变固定预算在通道间的分配。另外 `ntc-cli` 的 bpp 上限是 20，超了会报 `Cannot select a latent shape`。
-
-## 打包
-
-**运行时不需要 `ntc-cli.exe`，也不需要 `libntc.dll` 和 CUDA。** `ntc-cli` 只在 `Editor/NtcBakeWindow.cs` 里被调用，属于烘焙期工具；Runtime 那几个文件是纯 C# 加 compute shader。而 `Editor/` 是 Unity 的特殊目录名，里面的代码不会编译进 Player，所以那段找 exe 的逻辑根本不会出现在包里。玩家机器上只要有一块支持 ComputeShader 的 GPU。
-
-**但 `.ntc` 得自己放对位置。** `.ntc` 没有 Unity导入器，Unity 把它当未知资产，不在 StreamingAssets 里就不会进包。菜单 `NTC / Copy NtcData To StreamingAssets (for builds)` 会把烘好的 `.ntc` 镜像到 `StreamingAssets/NtcData/`。运行时的路径解析会依次尝试 `Assets/<配置路径>`（编辑器）、`StreamingAssets/<配置路径>`、`StreamingAssets/<末级目录名>`、`StreamingAssets` 根，取第一个存在的，所以同一份序列化配置在编辑器和 Player 里都能用，不用为每个平台改设置。
-
-还有两处容易漏：
-
-`NtcInferenceOnSample_URP` 和 `PBRChannelDebug_URP` 是用 `Shader.Find` 找的，而 `Shader.Find` 找不到已经被裁掉的 shader。打包前把它们加进 Project Settings → Graphics → Always Included Shaders，或者序列化引用到控制器字段上。`Resources/NtcDecompress.compute` 在 `Resources/` 下会自动进包，不用管。
-
-`NtcData/Decompressed/` 里那些解压预览 PNG 不用打包。它只是 on-Load 的legacy 兜底路径，compute 路径只需要 `.ntc`——只带 `.ntc` 才能体现用 NTC 的意义。
-
-如果目标平台不支持 ComputeShader，on-Load 和 on-Sample 都不可用，得回退 Original。
-
-## 实测数据
-
-测试环境是 RTX 5060 (8GB, SM 12.0)、Unity 2021.3.33f1c1URP、ntc-cli 0.9.2、CUDA 12.9.86（只有编译 ntc-cli 需要）。
-
-| 对象 | PSNR |
-|------|------|
-| MetalPlates013（单材质） | 45.26 dB |
-| Sponza 全场景，7 个材质 | 51.37 dB |
-
-都远超视觉无损的 40 dB 线。显存方面，on-Sample 只驻留 16MB latent 加 9KB 权重，对比 on-Load 的 6 张 2048² 贴图约 96MB，省了83%，跟 NVIDIA宣称的 85% 基本吻合。
-
-从源码和真实文件确认的几个参数：MLP 是 4 层 `48→64→48→32→16`，HGELUClamp 激活，权重 INT8（DP4A 路径）或 FloatE4M3（CoopVec 路径）。权重布局是 RowMajor，这一点是数据驱动读出来的，跟文档写的 ColumnMajor 默认值不一致，不能硬编码。Latent 源格式 BGRA4_UNORM，8 个 neural mip，每 mip 4 个 layer view，Unity 侧手动拆 nibble 展开成 RGBA32 的 Texture2DArray。
-
-## 架构
-
-分三层，压缩后端、传输格式、渲染集成互不绑定：
-
-```
-渲染集成   NtcSceneController<-> NtcTileStreamer <-> 材质
-GPU 解压   NtcDecompressor + NtcDecompress.compute + NtcInference.hlsl
-资产构建   NtcAssetBuilder（latent -> Texture2DArray，权重 -> ComputeBuffer）
-           NtcContainerReader（NTEX 容器纯 C# 解析）
-离线压缩   ntc-cli（NVIDIA 官方，CUDA）+ NtcBakeWindow 驱动
+```text
+NTCinUnity/
+├─ nvidia-backend/   NVIDIA RTXNTC 官方仓库（Git submodule）
+├─ unity-plugin/     Unity 插件源码
+├─ docs/             技术报告、使用与验证记录
+├─ LICENSE
+└─ THIRD-PARTY-NOTICES.md
 ```
 
-这么分的好处是 ntc-cli 升级不影响插件代码，渲染层换 HDRP 或自定义 SRP 不用动下层。容器解析用纯 C# 写而不是绑 NVIDIA 运行时，直接决定了打包后不用带任何原生DLL——这是当初做架构决策时最重要的一条。
+`nvidia-backend` 不是拷贝进来的 SDK 源码，而是指向 NVIDIA 官方仓库的 submodule。这样可以保留上游提交和许可证边界，也避免把本地 2.7 GB 的构建目录、嵌套 `.git` 和二进制误传到本仓库。
 
-## 已知限制
+克隆时需要带子模块：
 
-on-Sample 输出的是 Unlit。`NtcInferenceOnSample_URP` 只解码 BaseColor 三通道，不参与 URP 的完整光照和 BRDF，它的作用是验证逐像素解码正确性和显存优势。要光照版得扩成URP Surface shader。
+```bash
+git clone --recursive https://github.com/kiiye9697/NTCinUnity.git
+```
 
-材质参数匹配是启发式的，按属性名和贴图名里的关键词（`basecolor`、`normal`、`metallic`、`rough`、`occl`、`alpha` 等）识别，没有自定义映射表。
+已经克隆过主仓库的话：
 
-Runtime 和 Editor 目前靠 `Editor/` 目录名隔离，功能上没问题，但没有 Assembly Definition，约束不了依赖方向，也不方便做成 UPM 包。
+```bash
+git submodule update --init --recursive
+```
 
-`unity-plugin/README_NTC.md` 的文案还是早期 Sponza 特化版，开头写着「本工程是 Classic-Sponza 的副本」，跟插件已经通用化的现状不符，待重写。
+## 当前实现
+
+### Editor 烘焙
+
+`unity-plugin/Editor/NtcBakeWindow.cs` 会扫描场景或项目材质，提取 BaseColor、Normal、AO、Metallic、Smoothness 和 Alpha Cutout 数据，生成 manifest，然后以外部进程调用 `ntc-cli`。
+
+默认设置：
+
+- 16 bpp，界面上限 20 bpp；
+- Metalness loss scale 24；
+- Smoothness/Roughness loss scale 16；
+- 强制 `--gdeflate off`，因为 Unity 运行时没有实现 GDeflate 解码。
+
+`ntc-cli` 属于离线烘焙工具。它不参与 Unity Player 的运行时逻辑，也不会被 `Editor/` 目录中的代码带进 Player。
+
+### Unity Runtime
+
+Runtime 不链接 `libntc.dll`，也不调用 CUDA。核心路径是：
+
+1. `NtcContainerReader` 读取 NTEX Header、JSON Chunk 和 Data Chunk；
+2. `NtcAssetBuilder` 把 latent 展开为 `Texture2DArray`，把 INT8 网络参数上传为 Raw `ComputeBuffer`；
+3. `NtcDecompressor` 用 compute shader 执行 MLP；
+4. `NtcSceneController` 负责材质扫描、模式切换和 PBR 贴图绑定；
+5. `NtcTileStreamer` 在 on-Sample 模式下按材质可见性和距离分帧填充缓存。
+
+网络拓扑来自 `.ntc` 数据：`48 -> 64 -> 48 -> 32 -> 16`，隐藏层使用 HGELUClamp。
+
+## 三种模式
+
+### Original
+
+恢复场景原始材质和贴图，作为画面对照。
+
+### Inference on Load
+
+进入模式时将整套 `.ntc` 解压到普通 PBR RenderTexture，再绑定回原材质。默认使用 compute shader；compute 不可用或失败时，可以退回到预先解压的 PNG。
+
+### Inference on Sample
+
+当前首选实现不是 fragment shader 每帧逐像素执行 MLP，而是 **tile cache**：
+
+- 只处理当前可见材质；
+- 近处材质优先；
+- 默认每块 `256 x 256`；
+- 缓存最长边默认限制为 1024；
+- 每帧最多调度 8 个 tile；
+- 材质不可见 5 秒后释放整张缓存。
+
+MLP 在 tile 解压阶段执行，最终 URP 材质采样的是缓存 RenderTexture。工程还保留了一个直接在 fragment 中执行 MLP 的回退 shader，但该路径只输出 BaseColor，属于 Unlit 验证路径，不代表完整 PBR 的默认实现。
+
+## 使用
+
+### 1. 准备插件
+
+把 `unity-plugin/` 复制到 Unity 工程的 `Assets/NtcPlugin/`。当前代码以 Unity 2021.3 URP 为验证环境。
+
+### 2. 准备 ntc-cli
+
+按照 `nvidia-backend/README.md` 构建 RTXNTC。烘焙窗口中的 `ntc-cli` 字段可以直接填写编译产物路径。
+
+### 3. 烘焙
+
+在 Unity 中打开：
+
+```text
+NTC / Bake Window
+```
+
+扫描材质、选择要处理的条目，然后执行批量烘焙。默认输出目录为：
+
+```text
+Assets/NtcPlugin/NtcData/
+```
+
+生成文件名通常是 `{MaterialName}.ntc`。
+
+### 4. 运行
+
+通过菜单创建控制器：
+
+```text
+NTC / Add Scene Controller
+```
+
+进入 Play 后，通过左上角面板切换 Original、on-Load 和 on-Sample；`F1` 可以隐藏面板。控制器默认在 `NtcPlugin/NtcData` 下按材质名查找 `.ntc`。
+
+## 当前边界
+
+这个版本首先保证 Editor 中的完整验证流程。需要注意：
+
+- 当前 `NtcSceneController` 使用 `Application.dataPath` 读取 `.ntc`，Player 数据打包方案尚未作为正式功能提交；
+- `.ntc` 不会因为放进任意 `Assets` 子目录就自动进入 Player，后续需要采用 StreamingAssets、Addressables 或自定义导入器，并同步修改加载接口；
+- 场景扫描目前读取 Renderer 的第一个 `sharedMaterial`，多材质槽没有完整覆盖；
+- 材质通道按名称启发式识别；
+- 当前验证目标是 URP；
+- on-Sample 的默认路径会分配普通 PBR tile cache，不能描述为“只驻留 latent 和权重”；
+- GDeflate BufferView 不支持，烘焙必须关闭 GDeflate。
+
+## Showcase
+
+本地使用 Classic Sponza 做效果验证，但该场景、美术资源和由其烘焙出的 `.ntc` 不在公开仓库中。
+
+演示 GIF 尚未录制。录制完成后会放在 `docs/images/showcase.gif`，用于展示 Original、on-Load 和 on-Sample 的实际切换效果。
+
+## 验证数据
+
+文档只保留能够对应到原始记录的数据：
+
+- MetalPlates013：将 `ntc-cli` 解压结果和源图逐像素比较，overall PSNR 为 **45.26 dB**；
+- SponzaBricks：`ntc-cli` 训练输出 PSNR 为 **51.37 dB**，这是单个材质的训练指标，不是 Sponza 全场景平均值；
+- `7/7 files parsed successfully` 指七个测试 `.ntc` 文件通过容器解析，不代表七个 Sponza 材质的统一质量统计；
+- 早期“16 MB 对 96 MB，节省 83%”是 prototype 的静态估算，没有计入当前 tile cache，因此不作为现版本显存结论。
+
+详细方法和限制见 [`docs/验证记录.md`](docs/验证记录.md)。
 
 ## 文档
 
-[docs/NTC技术报告-从论文到Unity插件落地.md](docs/NTC技术报告-从论文到Unity插件落地.md) 是主要的技术文档，前半部分精读论文（特征金字塔、量化感知训练、平铺位置编码、hardGELU），后半部分是实践：架构决策、烘焙工具链、打包约束，以及十个踩坑实录和一张红线总结表。
+- [`docs/技术报告.md`](docs/技术报告.md)：当前实现、数据流、关键设计和已知边界；
+- [`docs/使用说明.md`](docs/使用说明.md)：安装、烘焙、运行和排错；
+- [`docs/验证记录.md`](docs/验证记录.md)：保留下来的可复现数据和问题修复依据；
+- [`docs/README.md`](docs/README.md)：文档索引。
 
-`PROGRESS.md` 是按日期写的开发日志，比技术报告更细，排查过程的原始记录都在里面。
+## 许可证
 
-## 许可
+仓库不是 MIT、Apache-2.0 等开源许可证项目。Unity 插件中的两个 shader 文件移植了 NVIDIA RTXNTC SDK 的推理数学，受 NVIDIA RTX SDKs License Agreement 约束。本仓库使用研究与评估许可，具体边界见 [`LICENSE`](LICENSE) 和 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
 
-研究和评估用途，不是开源许可证，细节见 [LICENSE](LICENSE)。
-
-这样授权不是随意选的：本仓库有两个 shader 文件是 NVIDIA RTXNTC SDK 源码的移植（`NtcInference.hlsl` 和 `NtcDecompress.compute`），而 NVIDIA 的 SDK 许可证第 4(e) 条明确禁止让SDK 受开源许可证约束。给整个仓库挂 MIT 或 Apache-2.0 会违反这一条。这两个文件各自带了归属声明，说明它们受 NVIDIA 条款而非本仓库 LICENSE 约束。
-
-商业使用或再分发请先开 issue 联系。
+`nvidia-backend/` 作为官方 submodule 使用 NVIDIA 自己的许可证，本仓库的 `LICENSE` 不覆盖该子模块。

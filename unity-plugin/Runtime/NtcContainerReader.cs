@@ -1,7 +1,7 @@
 // NtcContainerReader.cs
 // Pure .NET (no UnityEngine dependency) reader for the NTC Texture Set container format
-// ("NTEX", see RTXNTC/docs/TextureSetFile.md). This is module C of the architecture described
-// in NTC_Unity_Architecture.md: it turns a raw ".ntc" file into a plain C# object graph
+// ("NTEX", see nvidia-backend/docs/TextureSetFile.md). It turns a raw ".ntc" file into
+// a plain C# object graph
 // (NtcTextureSetDocument) plus the raw data chunk bytes, without linking against LibNTC/CUDA.
 //
 // This file is designed to be usable in three contexts unchanged:

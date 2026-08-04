@@ -1,0 +1,4 @@
+[submodule "nvidia-backend"]
+	path = nvidia-backend
+	url = https://github.com/NVIDIA-RTX/RTXNTC.git
+	ignore = dirty
