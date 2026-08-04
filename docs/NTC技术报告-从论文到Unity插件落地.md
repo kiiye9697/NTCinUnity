@@ -387,22 +387,23 @@ NTC 让一个材质的所有通道共享同一个 bpp 预算。Metallic、Alpha 
 
 > 玩家机器上只需要一块支持 ComputeShader 的 GPU。这正是 8.1 节"NTEX 用纯 C# 解析"这个架构决策的回报。
 
-### 10.2 但 `.ntc` 数据文件默认进不了包
+### 10.2 `.ntc` 数据文件进包问题（已解决）
 
-这是一个**必须改**的点。默认实现里 `.ntc` 的加载路径是 `Application.dataPath` + `File.ReadAllBytes`，两个问题叠加：
+最初的实现里 `.ntc` 的加载路径是 `Application.dataPath` 拼相对路径再 `File.ReadAllBytes`。这在编辑器里成立，打包后必然失效，因为两个问题叠加在一起：
 
-| 问题 | Editor | Build |
-|------|--------|-------|
-| `Application.dataPath` 指向 | `<工程>/Assets` ✅ | `<游戏>_Data`（含义完全变了）❌ |
-| `.ntc` 是否在包里 | 在 Assets 里，直读没问题 ✅ | `.ntc` 无导入器 → 被当未知资产，**不进包** ❌ |
+`Application.dataPath` 在编辑器里指向 `<工程>/Assets`，在 Player 里指向 `<游戏>_Data`，含义完全变了。更麻烦的是 `.ntc` 没有 Unity导入器，会被当成未知资产，只要不在 `StreamingAssets` 或 `Resources` 下就根本不会被打进包。
 
-三种修法：
+当时评估过三条路：
 
-| 方案 | 做法 | 优点 | 代价 |
-|------|------|------|------|
-| **A. StreamingAssets**（改动最小） | `.ntc` 移到 `Assets/StreamingAssets/NtcData/`，路径改用 `Application.streamingAssetsPath` | 原样保留文件、仍可 `File.ReadAllBytes`、可后期替换 | Android/WebGL 需改 `UnityWebRequest` 异步读 |
-| **B. Resources + TextAsset** | `.ntc` 改名 `.ntc.bytes` 放 `Resources/`，`Resources.Load<TextAsset>().bytes` | 全平台一致、同步 API 最简单 | 全部无条件进包并常驻，无法热更/按需卸载 |
-| **C. Addressables / AssetBundle** | 打成 bundle 按需加载 | 生产级：按需加载、可热更、可分包 | 接入成本最高 |
+| 方案 | 做法 | 代价 |
+|------|------|------|
+| StreamingAssets | `.ntc` 放`Assets/StreamingAssets/NtcData/`，用 `Application.streamingAssetsPath` 定位 | Android/WebGL 需改 `UnityWebRequest` 异步读 |
+| Resources + TextAsset | 改名 `.ntc.bytes` 放 `Resources/`，`Resources.Load<TextAsset>().bytes` | 全部无条件进包并常驻，无法热更或按需卸载 |
+| Addressables / AssetBundle | 打成 bundle 按需加载 | 接入成本最高，但生产环境该走这条 |
+
+最终选了 StreamingAssets，实现上没有硬编码单一路径，而是让 `ToAbsolute()` 按顺序尝试一组候选目录，取第一个存在的：编辑器下先试 `Assets/<配置路径>`（烘焙窗口的输出位置），然后依次是 `StreamingAssets/<配置路径>`、`StreamingAssets/<末级目录名>`、`StreamingAssets` 根。这样同一份序列化配置在编辑器和 Player 里都能用，不需要为每个构建目标改设置；找不到时返回当前平台「本该」的位置，让报错信息指向用户应该放数据的地方，而不是一个无意义的路径。
+
+配套加了菜单项 `NTC / Copy NtcData To StreamingAssets (for builds)`，把烘好的 `.ntc` 镜像到 `StreamingAssets/NtcData/`。这一步必须在Build 之前做，否则打出来的包里每个材质都会报 not baked。
 
 ### 10.3 其他打包注意事项
 

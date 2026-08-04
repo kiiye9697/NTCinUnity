@@ -17,11 +17,11 @@ nvidia-backend/
 # 下有 119MB 的 burst dylib、Art/ 下有 80MB 的 .psd。示例工程不随插件分发。
 unity-showcase/
 
-# --- 烘焙产物（约 372 MB，可再生） -------------------------------------------
-# .ntc 是ntc-cli 的压缩输出，Decompressed/ 是解压预览 PNG。二者都可以用
-# NtcBakeWindow 从源贴图重新烘焙，不需要进版本库。
+# --- 烘焙产物 ---------------------------------------------------------------
+# .ntc 是从 Unity Classic-Sponza 的贴图压缩来的，属于那批美术资产的衍生数据，
+# 没有随附任何授权，所以不放进公开仓库（见 THIRD-PARTY-NOTICES.md 第 2 节）。
+# 要复现的话自行取得 Sponza，再用 NTC/Bake Window 烘一遍。
 unity-plugin/NtcData/
-!unity-plugin/NtcData.meta
 
 # ============================================================================
 # Unity 标准忽略项（若日后把示例工程纳入仓库时生效）

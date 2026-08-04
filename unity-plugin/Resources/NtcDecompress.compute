@@ -1,12 +1,27 @@
 // NtcDecompress.compute
 // GPU decompression of an NTC texture set into ordinary PBR RenderTextures.
 //
+// ---------------------------------------------------------------------------------------
+// ATTRIBUTION AND LICENSING -- READ BEFORE REDISTRIBUTING
+//
+// This software contains source code provided by NVIDIA Corporation.
+//
+// The decompression math in this kernel is a port of DecompressINT8.hlsl / Inference.hlsli
+// from the NVIDIA RTXNTC SDK (https://github.com/NVIDIA-RTX/RTXNTC). NVIDIA distributes
+// those files under the NVIDIA RTX SDKs License Agreement and marks them:
+//     SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+//     Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// NVIDIA's license, not this repository's LICENSE, governs the NVIDIA-derived portions
+// below. Obtain the SDK from NVIDIA and accept their terms before using or redistributing
+// this file. See THIRD-PARTY-NOTICES.md at the repository root.
+// ---------------------------------------------------------------------------------------
+//
 // This is the single compute kernel reused by BOTH runtime paths:
-//   * mode2 (on-Load) : dispatched once over the whole image at load time ->普通贴图缓存
+//   * mode2 (on-Load) : dispatched once over the whole image at load time -> plain texture cache
 //   * mode3 (on-Sample streaming): dispatched per visible tile into a capped-size cache
 //
-// It ports the official RTXNTC DecompressINT8.hlsl math (48->64->48->32->16 INT8 MLP,
-// HGELUClamp activation) but adapted to Unity's compute conventions:
+// Unity-specific adaptations relative to the official kernel:
 //   - Plain compute uniforms instead of a ConstantBuffer<NtcDecompressConstants> struct.
 //   - Named RWTexture2D outputs (BaseColor / Normal / Mask / AO) matching URP Lit inputs,
 //     instead of the official unbounded RWTexture2D<float4>[] UAV array.

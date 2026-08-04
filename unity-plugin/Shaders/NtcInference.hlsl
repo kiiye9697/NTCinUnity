@@ -1,6 +1,22 @@
 // NtcInference.hlsl
 // Pure-HLSL NTC (Neural Texture Compression) "Inference on Sample" math library.
 //
+// ---------------------------------------------------------------------------------------
+// ATTRIBUTION AND LICENSING -- READ BEFORE REDISTRIBUTING
+//
+// This software contains source code provided by NVIDIA Corporation.
+//
+// The inference math in this file is a port of Inference.hlsli from the NVIDIA RTXNTC SDK
+// (https://github.com/NVIDIA-RTX/RTXNTC). NVIDIA distributes that file under the NVIDIA
+// RTX SDKs License Agreement and marks it:
+//     SPDX-License-Identifier: LicenseRef-NvidiaProprietary
+//     Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+//
+// NVIDIA's license, not this repository's LICENSE, governs the NVIDIA-derived portions
+// below. Obtain the SDK from NVIDIA and accept their terms before using or redistributing
+// this file. See THIRD-PARTY-NOTICES.md at the repository root.
+// ---------------------------------------------------------------------------------------
+//
 // This is plain HLSL -- no CG legacy (no CGPROGRAM/cginc conventions, no auto-included
 // UnityCG). It is meant to be #include'd from inside an HLSLPROGRAM/HLSLINCLUDE block
 // (Built-in RP or URP). The caller declares the resource bindings (Texture2DArray,

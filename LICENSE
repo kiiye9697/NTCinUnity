@@ -1,0 +1,73 @@
+NTCinUnity — Research and Evaluation License
+============================================
+
+Copyright (c) 2026 kiiye9697
+
+This repository is published for research, study, and technical evaluation.
+
+It is **not** open source software. No open source license is granted. The
+permissions below are deliberately narrow, and that is not an oversight: part of
+this work is derived from the NVIDIA RTXNTC SDK, and NVIDIA's license for that
+SDK explicitly forbids placing it under a license that would require source
+disclosure or free redistribution. Applying MIT, Apache-2.0, or any similar
+license to this repository would violate those terms. See THIRD-PARTY-NOTICES.md
+for the details and for the files affected.
+
+
+1. Grant
+--------
+
+Subject to the restrictions in section 2, you may, at no charge:
+
+  a. download, read, and study this repository;
+  b. build and run it for internal research, teaching, benchmarking, or
+     technical evaluation;
+  c. modify it for those same purposes.
+
+
+2. Restrictions
+---------------
+
+You may not:
+
+  a. redistribute this repository, or any derivative of it, in source or binary
+     form, without prior written permission from the copyright holder;
+  b. use it, in whole or in part, in a commercial product or service;
+  c. remove or alter any copyright, attribution, or license notice, including the
+     NVIDIA notices described in THIRD-PARTY-NOTICES.md and reproduced in the
+     headers of the affected shader files;
+  d. sublicense or re-license any part of it, in particular under an open source
+     license.
+
+
+3. Third-party components
+-------------------------
+
+Portions of the shader code in this repository are derived from the NVIDIA RTXNTC
+SDK. Those portions are governed by NVIDIA's license, not by this file. You must
+obtain the SDK from NVIDIA and accept NVIDIA's terms separately. The affected
+files carry an attribution header identifying them.
+
+This repository does not redistribute the NVIDIA SDK, the `ntc-cli` executable,
+or any NVIDIA binary.
+
+
+4. No warranty
+--------------
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+5. Contact
+----------
+
+For any use beyond section 1, including commercial use or redistribution, open an
+issue at https://github.com/kiiye9697/NTCinUnity.
+
+This file is a statement of the terms under which the author publishes this code.
+It is not legal advice.
