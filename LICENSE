@@ -41,12 +41,11 @@ The NVIDIA-derived portions are governed by NVIDIA's terms, not by this license.
 The files carry attribution headers, and THIRD-PARTY-NOTICES.md records their
 origin.
 
-4. Other third-party material
------------------------------
+4. Unity
+--------
 
-Unity, the Universal Render Pipeline, Classic Sponza, and any local test assets
-remain subject to their respective terms. The public repository does not include
-the local Classic Sponza showcase or `.ntc` files baked from its textures.
+Unity and the Universal Render Pipeline remain subject to the Unity Software
+Terms. No Unity engine or URP source is licensed by this repository.
 
 5. No warranty
 --------------

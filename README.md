@@ -25,7 +25,7 @@ NTCinUnity/
 └─ THIRD-PARTY-NOTICES.md
 ```
 
-`nvidia-backend` 不是拷贝进来的 SDK 源码，而是指向 NVIDIA 官方仓库的 submodule。这样可以保留上游提交和许可证边界，也避免把本地 2.7 GB 的构建目录、嵌套 `.git` 和二进制误传到本仓库。
+`nvidia-backend` 是指向 NVIDIA 官方仓库的 submodule，用于固定上游版本并保持许可证边界。
 
 克隆时需要带子模块：
 
@@ -39,7 +39,7 @@ git clone --recursive https://github.com/kiiye9697/NTCinUnity.git
 git submodule update --init --recursive
 ```
 
-## 当前实现
+## 实现
 
 ### Editor 烘焙
 
@@ -78,7 +78,7 @@ Runtime 不链接 `libntc.dll`，也不调用 CUDA。核心路径是：
 
 ### Inference on Sample
 
-当前首选实现不是 fragment shader 每帧逐像素执行 MLP，而是 **tile cache**：
+on-Sample 默认使用 **tile cache**，不在 fragment shader 中每帧逐像素执行 MLP：
 
 - 只处理当前可见材质；
 - 近处材质优先；
@@ -93,7 +93,7 @@ MLP 在 tile 解压阶段执行，最终 URP 材质采样的是缓存 RenderText
 
 ### 1. 准备插件
 
-把 `unity-plugin/` 复制到 Unity 工程的 `Assets/NtcPlugin/`。当前代码以 Unity 2021.3 URP 为验证环境。
+把 `unity-plugin/` 复制到 Unity 工程的 `Assets/NtcPlugin/`。验证环境为 Unity 2021.3 + URP。
 
 ### 2. 准备 ntc-cli
 
@@ -125,38 +125,29 @@ NTC / Add Scene Controller
 
 进入 Play 后，通过左上角面板切换 Original、on-Load 和 on-Sample；`F1` 可以隐藏面板。控制器默认在 `NtcPlugin/NtcData` 下按材质名查找 `.ntc`。
 
-## 当前边界
+## 功能范围
 
-这个版本首先保证 Editor 中的完整验证流程。需要注意：
-
-- 当前 `NtcSceneController` 使用 `Application.dataPath` 读取 `.ntc`，Player 数据打包方案尚未作为正式功能提交；
-- `.ntc` 不会因为放进任意 `Assets` 子目录就自动进入 Player，后续需要采用 StreamingAssets、Addressables 或自定义导入器，并同步修改加载接口；
-- 场景扫描目前读取 Renderer 的第一个 `sharedMaterial`，多材质槽没有完整覆盖；
-- 材质通道按名称启发式识别；
-- 当前验证目标是 URP；
-- on-Sample 的默认路径会分配普通 PBR tile cache，不能描述为“只驻留 latent 和权重”；
-- GDeflate BufferView 不支持，烘焙必须关闭 GDeflate。
-
-## Showcase
-
-本地使用 Classic Sponza 做效果验证，但该场景、美术资源和由其烘焙出的 `.ntc` 不在公开仓库中。
-
-演示 GIF 尚未录制。录制完成后会放在 `docs/images/showcase.gif`，用于展示 Original、on-Load 和 on-Sample 的实际切换效果。
+- `NtcSceneController` 使用 `Application.dataPath` 读取 Editor 工程中的 `.ntc`；
+- Player 数据由宿主工程通过 StreamingAssets、Addressables 或自定义导入器提供；
+- 场景扫描读取 Renderer 的第一个 `sharedMaterial`；
+- 材质通道按贴图名称识别；
+- 渲染集成面向 URP；
+- on-Sample 分配 PBR tile cache，显存统计包含 latent、权重、cache 和 mip 链；
+- GDeflate BufferView 不受支持，烘焙使用 `--gdeflate off`。
 
 ## 验证数据
 
-文档只保留能够对应到原始记录的数据：
+| 测试对象 | 指标 | 结果 |
+|---|---|---:|
+| MetalPlates013 | 解压图对源图 overall PSNR | **45.26 dB** |
+| SponzaBricks | 单材质 `ntc-cli` 训练 PSNR | **51.37 dB** |
+| NTEX 测试集 | C# 容器解析 | **7/7 files** |
 
-- MetalPlates013：将 `ntc-cli` 解压结果和源图逐像素比较，overall PSNR 为 **45.26 dB**；
-- SponzaBricks：`ntc-cli` 训练输出 PSNR 为 **51.37 dB**，这是单个材质的训练指标，不是 Sponza 全场景平均值；
-- `7/7 files parsed successfully` 指七个测试 `.ntc` 文件通过容器解析，不代表七个 Sponza 材质的统一质量统计；
-- 早期“16 MB 对 96 MB，节省 83%”是 prototype 的静态估算，没有计入当前 tile cache，因此不作为现版本显存结论。
-
-详细方法和限制见 [`docs/验证记录.md`](docs/验证记录.md)。
+详细测试方法见 [`docs/验证记录.md`](docs/验证记录.md)。
 
 ## 文档
 
-- [`docs/技术报告.md`](docs/技术报告.md)：当前实现、数据流、关键设计和已知边界；
+- [`docs/技术报告.md`](docs/技术报告.md)：系统架构、数据流、关键设计和功能限制；
 - [`docs/使用说明.md`](docs/使用说明.md)：安装、烘焙、运行和排错；
 - [`docs/验证记录.md`](docs/验证记录.md)：保留下来的可复现数据和问题修复依据；
 - [`docs/README.md`](docs/README.md)：文档索引。

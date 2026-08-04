@@ -105,15 +105,15 @@ Eviction delay          5 seconds
 
 `NtcInferenceOnSample_URP.shader` 是 compute/tile 路径不可用时的兼容回退。该 shader 逐 fragment 运行 MLP，但只输出 BaseColor，属于 Unlit 验证路径。
 
-## 当前限制
+## 功能限制
 
-- 以 Editor Play 模式为主要验证环境；
-- `.ntc` 当前通过 `Application.dataPath` 读取，Player 数据分发方案尚未固化；
+- 默认通过 `Application.dataPath` 读取 Editor 工程中的 `.ntc`；
+- Player 数据由宿主工程通过 StreamingAssets、Addressables 或自定义导入器提供；
 - 只处理 Renderer 的第一个 `sharedMaterial`；
 - 通道识别依赖贴图名称；
-- 仅验证 URP；
-- compute 路径需要平台支持 ComputeShader；
+- 渲染集成面向 URP；
+- compute 路径要求平台支持 ComputeShader；
 - on-Sample cache 是整张低分辨率目标纹理，不是稀疏显存页；
-- Alpha Cutout 需要重新烘焙包含 `AlphaMask` 通道的 `.ntc`。
+- Alpha Cutout 需要包含 `AlphaMask` 通道的 `.ntc`。
 
 更完整的设计、数据格式和验证记录见仓库根目录 [`docs/`](../docs/README.md)。

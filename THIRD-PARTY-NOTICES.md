@@ -32,21 +32,6 @@ The rest of the Unity-specific code includes resource binding, NTEX parsing, GPU
 
 The plugin targets Unity 2021.3 and the Universal Render Pipeline. Unity is used under the Unity Software Terms accepted when installing and using the editor. No Unity engine or URP source is copied into this repository.
 
-## Classic Sponza development scene
-
-The local development showcase uses Unity's Classic Sponza sample, derived from the Crytek Sponza model. That scene is used only for local validation.
-
-The public repository does not include:
-
-- the showcase Unity project;
-- Classic Sponza meshes or textures;
-- HDR environment assets used by the local project;
-- `.ntc` files baked from those textures;
-- decompressed preview images derived from those textures;
-- the compiled showcase Player.
-
-Measurements in `docs/验证记录.md` are numerical observations only and do not include asset data.
-
 ## Summary
 
 | Component | Included | Terms |
@@ -54,5 +39,3 @@ Measurements in `docs/验证记录.md` are numerical observations only and do no
 | Original Unity plugin C# and Editor code | Yes | Repository `LICENSE` |
 | NVIDIA-derived portions of two shader files | Yes | NVIDIA RTXNTC terms and file attribution |
 | RTXNTC source | Referenced as official submodule | RTXNTC repository license |
-| Local RTXNTC build output and binaries | No | Not distributed |
-| Local Classic Sponza showcase and baked data | No | Not distributed |
