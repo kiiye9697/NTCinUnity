@@ -57,6 +57,7 @@ $RECYCLE.BIN/
 /docs/**
 !/docs/使用说明.md
 !/docs/实现说明.md
+!/docs/工具说明.md
 /tools/README.md
 /unity-plugin/README.md
 /unity-plugin/README.md.meta

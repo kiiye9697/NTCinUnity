@@ -75,6 +75,20 @@ git clone --recursive https://github.com/kiiye9697/NTCinUnity.git
 | `tools` | 项目准备、测试、运行和插件打包脚本 |
 | `nvidia-backend` | 固定版本的 NVIDIA RTXNTC 子模块 |
 
+## 配套工具
+
+| 工具 | 用途 |
+| --- | --- |
+| Bake Window | 批量烘焙、重烘焙和绑定已有 NTC 文件 |
+| Scene Controller / 通道面板 | 配置材质槽、切换运行模式、查看材质通道和资源占用 |
+| 材质图像导出 | 输出 Direct 材质探针及通道对照 PNG |
+| RenderDoc 抓帧 | 查看场景 draw、NTC compute dispatch 和 GPU 资源 |
+| Player / 测试脚本 | 准备工程、构建 Player、运行测试并生成 JSON、CSV 或 XML |
+| Export-NtcPackage | 导出 Unity 插件源码包 |
+| NVIDIA Explorer / Renderer | 查看压缩材质、调整压缩参数、渲染 glTF 模型并保存场景截图 |
+
+各工具的入口、参数和输出位置见 [工具说明](docs/工具说明.md#工具总览)。截图、材质对照图与 RenderDoc 的使用方式见 [截图与抓帧](docs/工具说明.md#截图与抓帧)。
+
 ## 参考文献
 
 Karthik Vaidyanathan, Marco Salvi, Bartlomiej Wronski, Tomas Akenine-Möller, Pontus Ebelin, and Aaron Lefohn. **Random-Access Neural Compression of Material Textures.** Proceedings of SIGGRAPH, 2023.
