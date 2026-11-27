@@ -10,6 +10,7 @@ param(
     [int]$Frames = 0,
     [float]$CameraHeight = [float]::NaN,
     [switch]$Build,
+    [switch]$ReviewPage,
     [switch]$LightingReview
 )
 $ErrorActionPreference = "Stop"
@@ -64,4 +65,8 @@ if ($LightingReview) {
     & $Encoder -hide_banner -y -loglevel warning -i $original -i $ntc -filter_complex $filter -map '[v]' -an -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -movflags +faststart $video
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $video)) { throw "A/B composition failed." }
     Write-Output "Showcase recorded: $video"
+    if ($ReviewPage) {
+        & python (Join-Path $PSScriptRoot "Build-NtcReview.py") --project $Project --recording $outputPath --output (Join-Path $outputPath "review")
+        if ($LASTEXITCODE -ne 0) { throw "Review page generation failed." }
+    }
 }
