@@ -49,7 +49,7 @@ git clone --recursive https://github.com/kiiye9697/NTCinUnity.git
 ```
 
 1. 将 `unity-plugin` 完整复制到 URP 工程的 `Assets/NtcPlugin`，保留 `.meta`；也可通过 Package Manager 安装其 `package.json`。
-2. 按 [RTXNTC 构建说明](nvidia-backend/README.md) 准备 `ntc-cli`，安装 Python 图像处理依赖：
+2. 按 [RTXNTC 构建说明](https://github.com/NVIDIA-RTX/RTXNTC/blob/1cfa9a514d1b893754df0d343e0dd9cf5a11567d/README.md) 准备 `ntc-cli`，安装 Python 图像处理依赖：
 
    ```bash
    python -m pip install pillow
