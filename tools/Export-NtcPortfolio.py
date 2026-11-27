@@ -42,8 +42,18 @@ def main(args):
                 p=Path(c[kind]);target=out/p.with_suffix('.webp');target.parent.mkdir(parents=True,exist_ok=True)
                 if not target.exists():Image.open(args.review/p).save(target,lossless=True,method=4)
                 c[kind]=p.with_suffix('.webp').as_posix()
+                preview=Path('previews')/p.with_suffix('.webp')
+                (out/preview).parent.mkdir(parents=True,exist_ok=True)
+                image=Image.open(target);image.thumbnail((640,640),Image.Resampling.LANCZOS)
+                image.save(out/preview,quality=84,method=5)
+                c[kind+'Preview']=preview.as_posix()
+        m['latentPreviews']=[]
         for p in m['latentImages']+[m['weights']]:
             target=out/p;target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(args.review/p,target)
+            if p in m['latentImages']:
+                preview=Path('previews')/Path(p).with_suffix('.webp');(out/preview).parent.mkdir(parents=True,exist_ok=True)
+                image=Image.open(target);image.thumbnail((320,320),Image.Resampling.LANCZOS);image.save(out/preview,quality=84,method=5)
+                m['latentPreviews'].append(preview.as_posix())
     for name in ['original','ntc-direct']:
         p=out/'media'/f'{name}.webp';p.parent.mkdir(exist_ok=True)
         Image.open(args.review/'media'/f'{name}.png').resize((1280,720),Image.Resampling.LANCZOS).save(p,quality=88,method=5)
@@ -54,6 +64,7 @@ def main(args):
     for path in (args.review/'figures').glob('*'):
         if path.suffix in ['.svg','.png']:
             target=out/'figures'/path.name;target.parent.mkdir(exist_ok=True);shutil.copy2(path,target)
+    report['preview']='640px WebP quality 84 display thumbnails; full channel images preserve the original PNG pixels losslessly. Quality metrics use the full channel images.'
     write_json('review-data.json',report)
 
     # Historical logs: no inferred association with the current 24 material bindings.
