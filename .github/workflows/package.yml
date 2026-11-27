@@ -6,13 +6,13 @@ jobs:
   package:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           submodules: false
       - name: Export clean Unity package
         shell: pwsh
         run: ./tools/Export-NtcPackage.ps1
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: NTC-Unity-source-package
           path: build/NTC-Unity-*.zip
