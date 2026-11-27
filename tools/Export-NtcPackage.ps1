@@ -7,13 +7,17 @@ $package = Get-Content -LiteralPath (Join-Path $source "package.json") -Raw | Co
 if (-not $Output) { $Output = Join-Path $repositoryRoot ("build/NTC-Unity-" + $package.version + ".zip") }
 $outputPath = [IO.Path]::GetFullPath($Output)
 [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($outputPath)) | Out-Null
-$files = @(Get-ChildItem -LiteralPath $source -File | Where-Object Name -ne "NtcData.meta")
+$packageFiles = @("package.json","package.json.meta","LICENSE.md","LICENSE.md.meta",
+    "THIRD-PARTY-NOTICES.md","THIRD-PARTY-NOTICES.md.meta",
+    "Runtime.meta","Editor.meta","Resources.meta","Shaders.meta","Tests.meta")
+$files = @(Get-ChildItem -LiteralPath $source -File | Where-Object { $_.Name -in $packageFiles })
 foreach ($folder in @("Runtime","Editor","Resources","Shaders","Tests")) {
     $files += Get-ChildItem -LiteralPath (Join-Path $source $folder) -Recurse -File
 }
 $files = @($files | Where-Object {
     $relative = $_.FullName.Substring($source.Length + 1)
-    -not (@($relative.Split([char[]]@('\','/')) | Where-Object { $_.StartsWith('.') }).Count)
+    $relative -notmatch '(^|[\\/])README\.md(\.meta)?$' -and
+        -not (@($relative.Split([char[]]@('\','/')) | Where-Object { $_.StartsWith('.') }).Count)
 } | Sort-Object FullName)
 foreach ($file in $files) {
     if ($file.Extension -ne ".meta" -and -not (Test-Path -LiteralPath ($file.FullName + ".meta"))) {

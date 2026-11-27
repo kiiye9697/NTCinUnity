@@ -1,76 +1,95 @@
 # NTCinUnity
 
-Unity URP 的 NVIDIA Neural Texture Compression 接入工具，覆盖离线烘焙、资产发布、运行时 PBR 采样、资源回收和 Player 验证。NVIDIA 后端通过固定版本的 Git submodule 提供；Unity Runtime 不依赖 CUDA、ntc-cli 或原生 NTC DLL。
+基于 NVIDIA RTXNTC 的 Unity URP 神经纹理压缩插件，提供材质纹理烘焙、压缩资产管理、GPU 解码和 PBR 材质采样。
 
-## 当前能用到什么程度
+NTC 将同一材质的多张纹理及其 mip 链联合编码为特征网格与小型神经网络，在访问纹理时重建所需通道。算法参考 SIGGRAPH 2023 论文 [Random-Access Neural Compression of Material Textures](https://research.nvidia.com/labs/rtr/neural_texture_compression/)，离线训练使用 [NVIDIA RTXNTC](https://github.com/NVIDIA-RTX/RTXNTC)。
 
-在 **Unity 2021.3.33f1 / URP 12.1.13 / Windows x64 D3D12 / RTX 5080 / Linear** 下验证。标准 URP/Lit 不透明、Alpha Clip 的 Metallic 材质可使用完整 PBR Direct；透明、视差、Specular、detail、clear coat、纹理 emission 等功能明确回退原材质。当前 Sponza 24 组中 22 组 Direct、2 组回退。
+## 功能
 
-当前回归包含 58 项 EditMode 检查，涵盖实际 fragment、stock URP Lit 对照、推理数值、材质开关、采样、绑定和显存估算。独立 Player 证明共享消费者保护、原图回收与恢复，以及实际材质出图。**这仍是研究与评估实现：完整场景帧性能、清除驱动缓存后的首次使用成本、其他 GPU/URP 版本尚待验收。**
+- **材质烘焙**：扫描场景材质，提取纹理与通道配置，调用 `ntc-cli` 批量压缩。
+- **资产绑定**：通过材质 GUID 和 local ID 管理压缩数据、材质模板及 Renderer 材质槽。
+- **PBR 直接采样**：在统一纹理组入口解码 BaseColor、Normal、Metallic、Roughness、AO 和 Alpha。
+- **采样设置**：保存各贴图的寻址模式、过滤方式、各向异性等级和 mip bias。
+- **资源管理**：管理 latent、权重及解码缓存，支持原材质恢复和原图引用释放。
 
-本机小材质探针首次绘制加同步回读 496ms，再次 3.1ms；驱动磁盘缓存未清除，这不是 GPU frame time。当前场景 Direct 估算纹理和 NTC 缓冲为 109.2MiB，Original 为 86.3MiB，不能据此宣称净省显存。
+Direct 使用 URP/Lit 的 Metallic 工作流，支持不透明和 Alpha Clip 材质。其余材质保留原材质。
 
-## 完整链路
+## 工作流程
 
 ```mermaid
 flowchart LR
-    A[保存的 URP 材质与贴图] --> B[Bake Window: manifest / 通道与采样约定]
-    B --> C[ntc-cli 离线训练]
-    C --> D[验证 NTEX / GUID 绑定资产]
-    D --> E[StreamingAssets 数据 / 无纹理模板 / 可恢复原图]
-    E --> F[Scene Controller 精确材质槽]
-    F --> G[Original / 整图解码 / Tile Cache / Direct PBR]
-    G --> H[资源账本 / 生命周期 / 实际绘制验收]
+    A[材质与源贴图] --> B[Bake Window]
+    B --> C[ntc-cli 压缩]
+    C --> D[NTC 数据与 GUID 绑定资产]
+    D --> E[Scene Controller]
+    E --> F[GPU 解码与 PBR 着色]
 ```
 
-Direct 在纹理组访问入口进行推理，一次网络输出提供 BaseColor、Normal、Metallic、Roughness、AO 和 Alpha。采样角色可共享结果；滤波循环共用解码调用点，控制首次驱动编译展开量。它采用可移植 shader 数学，没有验证 Tensor/CoopVec 或硬件 DP4A 指令路径。
+运行时提供四种模式：
 
-| 模式 | 工作方式 | 用途 |
-| --- | --- | --- |
-| Original | 原始材质与贴图 | 对照与明确回退 |
-| InferenceOnLoad | Compute 解压完整 PBR 贴图 | 数值/画面验证，解码缓存可能很大 |
-| InferenceOnSample | 按可见性和预算解压 tile 到 PBR cache | 分帧加载；名称沿用旧版本 |
-| InferenceOnSampleDirect | fragment 访问时推理完整材质通道 | 标准 URP/Lit Direct 路径，无完整解码缓存 |
+| 模式 | 实现 |
+| --- | --- |
+| `Original` | 使用原始材质 |
+| `InferenceOnLoad` | 通过 Compute Shader 解压完整 PBR 贴图 |
+| `InferenceOnSample` | 根据可见性和预算分帧解压 tile 到缓存 |
+| `InferenceOnSampleDirect` | 在 fragment shader 访问纹理组时执行推理 |
 
-旧 BaseColor Unlit shader 只用于兼容诊断，不代表完整 PBR Direct。
+Unity Runtime 使用 C# 和 shader 实现，不依赖 CUDA、`ntc-cli` 或原生 NTC DLL。
 
-## 安装和首次使用
+## 环境
 
-仅使用 Unity 包无需拉取 NVIDIA 子模块；离线烘焙时才需要构建后端。
+- Unity 2021.3、URP 12
+- Windows x64、Direct3D 12
+- 离线烘焙：NVIDIA `ntc-cli`、Python、Pillow
+
+## 快速开始
 
 ```bash
 git clone --recursive https://github.com/kiiye9697/NTCinUnity.git
 ```
 
-1. 在 URP 工程中通过 Package Manager 安装 `unity-plugin/package.json`，或将完整目录连同 `.meta` 复制到 `Assets/NtcPlugin`。不要两种方式同时安装。
-2. 按 [NVIDIA 后端说明](nvidia-backend/README.md) 构建 `ntc-cli`，准备支持 Pillow 的 Python。
-3. 保存源材质资产，在 `NTC / Bake Window` 扫描并烘焙。成功后自动发布 GUID/localId 绑定、StreamingAssets 数据、无纹理模板与 Resources 恢复材质；支持单张输入图。
-4. `NTC / Add Scene Controller` 或 `NTC / Rescan Scene Materials`，保存场景，检查准确槽位和不支持原因。新烘焙完成后需要重新扫描并保存。
-5. 先在 Original 对照，再切换目标模式。确认数据、shader 引用及绑定资产进入 Player，完成生命周期、实际绘制和目标设备性能验证。
+1. 将 `unity-plugin` 完整复制到 URP 工程的 `Assets/NtcPlugin`，保留 `.meta`；也可通过 Package Manager 安装其 `package.json`。
+2. 按 [RTXNTC 构建说明](nvidia-backend/README.md) 准备 `ntc-cli`，安装 Python 图像处理依赖：
 
-详细设置与输出约定见 [使用说明](docs/使用说明.md) 和 [接入契约](docs/INTEGRATION.md)。示例 Sponza 美术、烘焙 NtcData 和本机 Showcase 工程不随仓库发布；公共 clone 可安装插件，在自己的 URP 工程和素材上烘焙。
+   ```bash
+   python -m pip install pillow
+   ```
 
-## 工程与工具
+3. 保存源材质，打开 `NTC / Bake Window`，设置工具路径，扫描并烘焙材质。
+4. 使用 `NTC / Add Scene Controller` 添加控制器；烘焙或修改材质后使用 `NTC / Rescan Scene Materials` 重新扫描并保存场景。
+5. 进入 Play，通过控制面板切换运行模式。
 
-| 位置 | 职责 |
+烘焙会生成 `Assets/NtcBindings` 绑定资产、`StreamingAssets/NtcData` 数据文件，以及用于恢复原材质的 `Resources/NtcOriginals` 资产。项目中的示例美术和生成数据由使用者自行提供。
+
+详细配置见 [使用说明](docs/使用说明.md)，运行时结构见 [实现说明](docs/实现说明.md)。
+
+## 工程结构
+
+| 目录 | 内容 |
 | --- | --- |
-| [unity-plugin/Runtime](unity-plugin/Runtime) | 容器校验、GPU 资产、统一材质绑定、模式与资源生命周期 |
-| [unity-plugin/Shaders](unity-plugin/Shaders) / [Resources](unity-plugin/Resources) | 完整 PBR Direct、推理、compute 解码和调试 |
-| [unity-plugin/Editor](unity-plugin/Editor) | 烘焙、GUID 发布、场景扫描和验收构建 |
-| [unity-plugin/Tests](unity-plugin/Tests) | 无需美术的合约测试及需外部语料/GPU 的回归 |
-| [tools](tools) | 可重复准备、测试、构建、运行和打包入口 |
-| [docs](docs/README.md) | 使用、架构、验收方法与已知边界 |
-| [nvidia-backend](nvidia-backend) | 固定版本 NVIDIA RTXNTC 子模块，负责离线训练 |
+| `unity-plugin/Runtime` | NTEX 解析、GPU 资产、材质绑定与资源管理 |
+| `unity-plugin/Editor` | 烘焙窗口、资产发布、场景配置与构建工具 |
+| `unity-plugin/Shaders` | NTC 推理、统一纹理组采样与 URP PBR shader |
+| `unity-plugin/Resources` | Compute 解码 kernel |
+| `unity-plugin/Tests` | 容器、材质、采样及资源管理测试 |
+| `tools` | 项目准备、测试、运行和插件打包脚本 |
+| `nvidia-backend` | 固定版本的 NVIDIA RTXNTC 子模块 |
 
-```powershell
-# 外部25文件语料不随仓库提供；具体要求见 Tests/README.md
-.\tools\Run-NtcEditModeTests.ps1 -UnityEditor '<Unity.exe>' -Corpus '<corpus>'
+## 参考文献
+
+Karthik Vaidyanathan, Marco Salvi, Bartlomiej Wronski, Tomas Akenine-Möller, Pontus Ebelin, and Aaron Lefohn. **Random-Access Neural Compression of Material Textures.** Proceedings of SIGGRAPH, 2023.
+
+[论文主页](https://research.nvidia.com/labs/rtr/neural_texture_compression/) · [论文 PDF](https://research.nvidia.com/labs/rtr/neural_texture_compression/assets/ntc_medium_size.pdf) · [官方实现](https://github.com/NVIDIA-RTX/RTXNTC)
+
+```bibtex
+@inproceedings{ntc2023,
+    author = {Vaidyanathan, Karthik and Salvi, Marco and Wronski, Bartlomiej and Akenine-Möller, Tomas and Ebelin, Pontus and Lefohn, Aaron},
+    title = {Random-Access Neural Compression of Material Textures},
+    year = {2023},
+    booktitle = {Proceedings of SIGGRAPH}
+}
 ```
 
-Showcase 工具面向本地已有场景；不自动下载第三方美术。[工具说明](tools/README.md) 给出参数、前置条件、成功标准和产物边界。
+## License
 
-## 文档与许可
-
-[接入与契约](docs/INTEGRATION.md) · [技术说明](docs/技术报告.md) · [验证记录](docs/验证记录.md) · [基准方法](docs/BENCHMARK.md)
-
-本仓库采用 [NTCinUnity Research and Evaluation License](LICENSE)。NVIDIA 子模块及衍生 shader 的条款见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)，不能将此实现视为不受限制的生产许可证。
+项目代码采用 [NTCinUnity Research and Evaluation License](LICENSE)。NVIDIA RTXNTC 及其衍生 shader 适用对应的 NVIDIA 许可，详见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。

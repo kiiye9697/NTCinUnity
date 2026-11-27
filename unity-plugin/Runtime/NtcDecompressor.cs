@@ -168,16 +168,8 @@ namespace Ntc.Unity
             }
         }
 
-        // Mask (metallic/smoothness) gets 16 bits per channel instead of the 8 bits used for
-        // Color/Normal/AO. Rationale: 8-bit UNORM quantization error is only ~0.4% (1/255), which
-        // is far smaller than the ~6-18% smoothness fidelity loss measured 2026-07-10 (see
-        // docs/验证记录.md) -- so 8-bit output is NOT the main cause of that loss (the shared-bpp-budget
-        // / lossFunctionScale issue is). But smoothness feeds a perceptually-remapped, squared curve
-        // (roughness = (1-smoothness)^2 in BRDF.hlsl) that amplifies low-end quantization steps into
-        // visible specular banding, and today's source *_Smoothness.tif assets are 8-bit anyway --
-        // this is cheap headroom for when higher-bit-depth source art is used, or once the MLP loss
-        // weight fix (lossFunctionScale) closes most of the gap, so residual 8-bit banding does not
-        // become the next visible artifact.
+        // Store metallic/smoothness at 16 bits per channel to reduce quantization
+        // banding when smoothness is remapped to roughness by the BRDF.
         static readonly GraphicsFormat kMaskFormat = GraphicsFormat.R16G16B16A16_UNorm;
 
         /// <summary>Allocate the PBR RenderTextures needed for a given channel layout.</summary>

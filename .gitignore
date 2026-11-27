@@ -52,3 +52,15 @@ $RECYCLE.BIN/
 *.7z
 *.rar
 *.stackdump
+
+# Local project notes and internal review records.
+/docs/**
+!/docs/使用说明.md
+!/docs/实现说明.md
+/tools/README.md
+/unity-plugin/README.md
+/unity-plugin/README.md.meta
+/unity-plugin/INTEGRATION.md
+/unity-plugin/INTEGRATION.md.meta
+/unity-plugin/Tests/README.md
+/unity-plugin/Tests/README.md.meta
