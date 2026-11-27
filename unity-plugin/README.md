@@ -1,119 +1,18 @@
-# NTC Unity Plugin
+# NTC Unity Plugin 0.2
 
-这个目录可以直接复制到 Unity 工程的 `Assets/NtcPlugin/`。
+Unity URP 的离线材质烘焙与运行时神经纹理访问包。使用完整目录连同 `.meta`；支持 UPM 本地安装，或复制到 `Assets/NtcPlugin`，不要重复安装。宿主工程先配置兼容 URP。
 
-验证环境为 Unity 2021.3 + URP。插件由 Runtime、Editor、Shaders 和 Resources 四部分组成：
+[完整接入说明](INTEGRATION.md) 是本包当前使用契约。烘焙生成 GUID/localId 绑定和数据；添加 Controller 后重新扫描、保存场景，再进行 Player 验收。旧的按材质名称寻找文件仅作迁移兼容。
 
-```text
-unity-plugin/
-├─ Runtime/
-│  ├─ NtcContainerReader.cs   NTEX 容器解析
-│  ├─ NtcJson.cs              零依赖 JSON 解析
-│  ├─ NtcAssetBuilder.cs      latent / 权重 GPU 资产构建
-│  ├─ NtcDecompressor.cs      compute 解压调度
-│  ├─ NtcTileStreamer.cs      分块缓存与可见性调度
-│  ├─ NtcSceneController.cs   场景扫描、模式切换、材质绑定
-│  └─ NtcPackingReport.cs     容器结构报告
-├─ Editor/
-│  ├─ NtcBakeWindow.cs        材质扫描与批量烘焙
-│  ├─ NtcSetupMenu.cs         菜单入口
-│  └─ NtcSceneControllerEditor.cs
-├─ Shaders/
-│  ├─ NtcInference.hlsl
-│  ├─ NtcInferenceOnSample_URP.shader
-│  └─ PBRChannelDebug_URP.shader
-└─ Resources/
-   └─ NtcDecompress.compute
-```
+| 内容 | 职责 |
+| --- | --- |
+| Runtime | 解析/格式校验、GPU 资产、完整 PBR 绑定、原图恢复与资源统计 |
+| Editor | 烘焙、主线程发布资产、精确材质槽、准备/构建验收场景 |
+| Shaders / Resources | Direct URP Lit、统一纹理组访问、compute 解码、调试 |
+| Tests | 合约、真实数值/fragment、资产与资源回归，见 Tests/README.md |
 
-## 安装
+Direct 支持标准 URP/Lit opaque/alpha clip 的 Metallic 工作流，输出 BaseColor、Normal、Metallic、Roughness、AO 和 Alpha。透明、视差、Specular、detail、clear coat、纹理 emission 等特性显式回退 Original。Runtime 无 CUDA/ntc-cli 依赖；离线烘焙需要对应工具及 Python/Pillow。
 
-把整个目录放进目标工程：
+已验证 Windows D3D12 / Unity 2021.3.33f1 / URP12.1.13 / RTX5080 / Linear。58 项测试通过和小 Player 实际绘制/回收验证不能替代目标项目的完整场景性能验收。当前示例 Direct 估算显存高于原 BCn 纹理；不保证净显存收益。首次使用计时包含同步回读且未清驱动磁盘缓存。
 
-```text
-Assets/NtcPlugin/
-```
-
-Unity 会根据随附 `.meta` 保持资源 GUID。不要只复制 `.cs` 而漏掉 shader、compute 或 `.meta`。
-
-## 烘焙
-
-烘焙需要 NVIDIA RTXNTC 的 `ntc-cli`，运行时不需要。官方源码在仓库根目录的 `nvidia-backend` submodule 中，也可以从 NVIDIA 官方仓库单独取得。
-
-在 Unity 打开：
-
-```text
-NTC / Bake Window
-```
-
-推荐流程：
-
-1. 在 `ntc-cli` 字段选择本机编译好的可执行文件；
-2. `Scan Scene Materials` 或扫描项目材质；
-3. 确认每个条目至少解析到两张贴图；
-4. 选择条目并开始批量烘焙；
-5. 输出到 `Assets/NtcPlugin/NtcData/`。
-
-默认参数：
-
-```text
-Bits per pixel                  16
-Metalness loss scale           24
-Smoothness/Roughness scale     16
-GDeflate                       off
-```
-
-不要开启 GDeflate。`NtcContainerReader` 能读 BufferView 描述，但不会解压 GDeflate 数据。
-
-## 运行
-
-创建控制器：
-
-```text
-NTC / Add Scene Controller
-```
-
-控制器默认查找：
-
-```text
-Assets/NtcPlugin/NtcData/{MaterialName}.ntc
-```
-
-如果烘焙时设置了文件名前缀，在控制器的 `ntcFilePrefix` 中填写相同前缀。
-
-进入 Play 后，左上角面板可切换：
-
-- `Original`：原始材质；
-- `on-Load`：compute 整图解压到 PBR RenderTexture；
-- `on-Sample`：默认走可见材质的分块解压缓存；
-- `Lit / Base / Normal / Metal / Rough`：通道检查。
-
-`F1` 隐藏或显示面板。
-
-## on-Sample 的准确含义
-
-当前默认路径是 tile cache，而不是每个 fragment 永久执行 MLP。它会为可见材质分配一个受分辨率上限约束的 PBR 缓存，分帧解压 tile，随后让普通 URP 材质采样该缓存。
-
-默认值：
-
-```text
-Tile size               256
-Cache max dimension     1024
-Tiles per frame         8
-Eviction delay          5 seconds
-```
-
-`NtcInferenceOnSample_URP.shader` 是 compute/tile 路径不可用时的兼容回退。该 shader 逐 fragment 运行 MLP，但只输出 BaseColor，属于 Unlit 验证路径。
-
-## 功能限制
-
-- 默认通过 `Application.dataPath` 读取 Editor 工程中的 `.ntc`；
-- Player 数据由宿主工程通过 StreamingAssets、Addressables 或自定义导入器提供；
-- 只处理 Renderer 的第一个 `sharedMaterial`；
-- 通道识别依赖贴图名称；
-- 渲染集成面向 URP；
-- compute 路径要求平台支持 ComputeShader；
-- on-Sample cache 是整张低分辨率目标纹理，不是稀疏显存页；
-- Alpha Cutout 需要包含 `AlphaMask` 通道的 `.ntc`。
-
-更完整的设计、数据格式和验证记录见仓库根目录 [`docs/`](../docs/README.md)。
+本包不含 Sponza 美术、大型 NtcData 或 NVIDIA SDK。许可见 LICENSE.md 与 THIRD-PARTY-NOTICES.md。

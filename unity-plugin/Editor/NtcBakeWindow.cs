@@ -13,6 +13,7 @@ using ProcessStartInfo = System.Diagnostics.ProcessStartInfo;
 using UnityEditor;
 using UnityEngine;
 using Ntc.Packing;
+using Ntc.Unity;
 
 namespace Ntc.UnityEditorTools
 {
@@ -21,6 +22,8 @@ namespace Ntc.UnityEditorTools
         class MaterialEntry
         {
             public string materialName;
+            public Material sourceMaterial;
+            public string stableId;
             public readonly List<TextureRef> textures = new List<TextureRef>();
             public bool selected = true;
             public bool hasNtc;
@@ -28,6 +31,14 @@ namespace Ntc.UnityEditorTools
             public long ntcSize;
             public string psnr;
             public string status;
+        }
+
+        // Unity objects and mutable GUI entries are never read by the worker.
+        sealed class BakeJob
+        {
+            public string materialName, stableId;
+            public int trainingSteps;
+            public readonly List<TextureRef> textures = new List<TextureRef>();
         }
 
         class TextureRef
@@ -99,6 +110,7 @@ namespace Ntc.UnityEditorTools
         string _pythonPath;
         string _outputDir;
         float _bpp;
+        int _trainingSteps = 100000;
         float _metalLossScale;
         float _smoothLossScale;
         // Convention-based texture lookup root (relative to Assets/), used by
@@ -145,6 +157,8 @@ namespace Ntc.UnityEditorTools
         void OnEnable()
         {
             _ntcCliPath = EditorPrefs.GetString(kPrefNtcCli, AutoDetectNtcCli());
+            if (ResolveExecutable(_ntcCliPath) == null) _ntcCliPath = AutoDetectNtcCli();
+            _trainingSteps = EditorPrefs.GetInt("NTC_Bake_trainingSteps",100000);
             _pythonPath = EditorPrefs.GetString(kPrefPython, "python");
             _bpp = EditorPrefs.GetFloat(kPrefBpp, 16f);
             _metalLossScale = EditorPrefs.GetFloat(kPrefMetalLossScale, 24f);
@@ -160,6 +174,7 @@ namespace Ntc.UnityEditorTools
             EditorPrefs.SetString(kPrefNtcCli, _ntcCliPath ?? "");
             EditorPrefs.SetString(kPrefPython, _pythonPath ?? "python");
             EditorPrefs.SetFloat(kPrefBpp, _bpp);
+            EditorPrefs.SetInt("NTC_Bake_trainingSteps",_trainingSteps);
             EditorPrefs.SetFloat(kPrefMetalLossScale, _metalLossScale);
             EditorPrefs.SetFloat(kPrefSmoothLossScale, _smoothLossScale);
             EditorPrefs.SetString(kPrefTextureSourcePath, _textureSourcePath ?? "");
@@ -174,6 +189,11 @@ namespace Ntc.UnityEditorTools
             string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
             string hit = Path.Combine(projectRoot, "ntc-cli.exe");
             if (File.Exists(hit)) return hit.Replace('\\', '/');
+            for (string dir = projectRoot; dir != null; dir = Directory.GetParent(dir)?.FullName)
+            {
+                hit = Path.Combine(dir,"nvidia-backend/bin/windows-x64/ntc-cli.exe");
+                if (File.Exists(hit)) return hit.Replace('\\','/');
+            }
 
             string packagesDir = Path.Combine(projectRoot, "Packages");
             if (Directory.Exists(packagesDir))
@@ -266,10 +286,11 @@ namespace Ntc.UnityEditorTools
             _smoothLossScale = EditorGUILayout.Slider("Smoothness/Roughness loss scale (" + LossScaleLabel(_smoothLossScale) + ")", _smoothLossScale, 1f, 32f);
             EditorGUILayout.HelpBox("Same meaning and mechanism as Metalness loss scale above (relative weight vs. the other channels' implicit 1x, same fixed bpp budget), applied to the Smoothness/Roughness channel instead. Measured 2026-07-10 across all 17 baked Sponza materials at the previous default of 1x: decompressed-vs-source pixel stddev ratio for Smoothness averages ~0.94 (worst case Ceiling 0.824), noticeably worse than Color (~0.999), Normal (~0.98) and AO (~0.987) in the SAME materials -- i.e. this channel was losing more fine detail/contrast than the others. Rebake affected materials and re-check the pixel comparison after changing this; if 16x is not enough, try stepping up toward 24x (the value that fixed Metalness) before going higher.", MessageType.None);
             _outputDir = EditorGUILayout.TextField("Output dir", _outputDir);
+            _trainingSteps = Mathf.Clamp(EditorGUILayout.IntField("Training steps",_trainingSteps),1,1000000);
             _textureSourcePath = EditorGUILayout.TextField("Texture source (Assets/ subpath)", _textureSourcePath);
             EditorGUILayout.HelpBox("Convention-based texture lookup root (relative to Assets/), used only when a material has no _BaseMap/_MainTex assigned. Empty = skip. Was hardcoded to the Sponza art folder.", MessageType.None);
             _ntcFilePrefix = EditorGUILayout.TextField(".ntc file name prefix", _ntcFilePrefix);
-            EditorGUILayout.HelpBox("Prefix prepended to {materialName}.ntc in the output dir, e.g. \"Sponza\" -> SponzaBricks.ntc. Empty = no prefix.", MessageType.None);
+            EditorGUILayout.HelpBox("New output names use material GUID + local file ID. The prefix is only used to discover legacy files; it never changes stable output names.", MessageType.None);
 
             if (!File.Exists(_ntcCliPath))
                 EditorGUILayout.HelpBox("ntc-cli not found at the specified path.", MessageType.Warning);
@@ -301,7 +322,7 @@ namespace Ntc.UnityEditorTools
             GUILayout.Label(e.status ?? "", GUILayout.Width(110));
 
             GUILayout.FlexibleSpace();
-            GUI.enabled = !_uiBaking && e.textures.Count >= 2;
+            GUI.enabled = !_uiBaking && e.textures.Count >= 1 && !string.IsNullOrEmpty(e.stableId);
             if (GUILayout.Button(e.hasNtc ? "Rebake" : "Bake", GUILayout.Width(64)))
             {
                 StartBake(new List<MaterialEntry> { e });
@@ -316,7 +337,16 @@ namespace Ntc.UnityEditorTools
             EditorGUILayout.BeginHorizontal();
             GUI.enabled = !_uiBaking;
             if (GUILayout.Button("Bake All Selected", GUILayout.Height(28)))
-                StartBake(_entries.FindAll(e => e.selected && e.textures.Count >= 2));
+                StartBake(_entries.FindAll(e => e.selected && e.textures.Count >= 1 && !string.IsNullOrEmpty(e.stableId)));
+            if (GUILayout.Button("Bind Existing Selected", GUILayout.Height(28)))
+            {
+                foreach (MaterialEntry entry in _entries)
+                {
+                    if (!entry.selected || !entry.hasNtc || entry.sourceMaterial == null) continue;
+                    try { NtcTextureSetAssetEditor.CreateOrUpdate(entry.sourceMaterial, entry.ntcPath); entry.status = "bound"; }
+                    catch (Exception error) { entry.status = "binding error"; UnityEngine.Debug.LogException(error); }
+                }
+            }
             if (GUILayout.Button("Select All", GUILayout.Width(86)))
                 foreach (MaterialEntry e in _entries) e.selected = true;
             if (GUILayout.Button("Select None", GUILayout.Width(96)))
@@ -353,30 +383,40 @@ namespace Ntc.UnityEditorTools
         {
             _entries.Clear();
 
-            var byMaterial = new Dictionary<string, Material>();
 #if UNITY_2022_2_OR_NEWER
             Renderer[] renderers = UnityEngine.Object.FindObjectsByType<Renderer>(FindObjectsSortMode.None);
 #else
             Renderer[] renderers = UnityEngine.Object.FindObjectsOfType<Renderer>();
 #endif
-            foreach (Renderer r in renderers)
+            foreach (Material material in CollectDistinctMaterials(renderers))
             {
-                Material m = r.sharedMaterial;
-                if (m == null) continue;
-                if (!byMaterial.ContainsKey(m.name))
-                    byMaterial.Add(m.name, m);
-            }
-
-            foreach (KeyValuePair<string, Material> pair in byMaterial)
-            {
-                var entry = new MaterialEntry { materialName = pair.Key };
-                CollectTextures(pair.Value, entry);
-                CheckBakeStatus(entry);
+                var entry = new MaterialEntry { materialName = material.name, sourceMaterial = material };
+                try
+                {
+                    entry.stableId = NtcTextureSetAssetEditor.StableId(material);
+                    CollectTextures(material, entry);
+                    CheckBakeStatus(entry);
+                }
+                catch (Exception error) { entry.selected = false; entry.status = error.Message; }
                 _entries.Add(entry);
             }
 
+            RefreshBakeStatuses();
             _scanned = true;
             UnityEngine.Debug.Log("[NTC Bake] Scanned " + _entries.Count + " materials, " + _entries.FindAll(e => e.hasNtc).Count + " baked.");
+        }
+
+        public static Material[] CollectDistinctMaterials(Renderer[] renderers)
+        {
+            var seen = new HashSet<Material>();
+            var materials = new List<Material>();
+            foreach (Renderer renderer in renderers)
+            {
+                if (renderer == null) continue;
+                foreach (Material material in renderer.sharedMaterials)
+                    if (material != null && seen.Add(material)) materials.Add(material);
+            }
+            return materials.ToArray();
         }
 
         void RefreshBakeStatuses()
@@ -391,7 +431,9 @@ namespace Ntc.UnityEditorTools
             AddTextureFromProperty(mat, entry, "_MainTex", "Diffuse");
             AddTextureFromProperty(mat, entry, "_BumpMap", "Normal");
             AddTextureFromProperty(mat, entry, "_NormalMap", "Normal");
-            AddTextureFromProperty(mat, entry, "_OcclusionMap", "AO");
+            // URP Lit reads occlusion from G, including packed mask textures.
+            // Convention-based standalone *_AO files still use their R channel.
+            AddTextureFromProperty(mat, entry, "_OcclusionMap", SpecForSuffix("AO"), "G");
 
             // URP Lit packs metallic in R and smoothness in A of _MetallicGlossMap.
             // Bake them as two scalar NTC textures instead of wasting RGB channels on the same map.
@@ -419,9 +461,13 @@ namespace Ntc.UnityEditorTools
         void AddAlphaCutoutFromBaseMap(Material mat, MaterialEntry entry, string property)
         {
             if (!mat.HasProperty(property)) return;
-            if (!mat.HasProperty("_AlphaClip") || mat.GetFloat("_AlphaClip") <= 0.5f)
-                if (!mat.IsKeywordEnabled("_ALPHATEST_ON"))
-                    return;
+            bool needsAlpha = (mat.HasProperty("_AlphaClip") && mat.GetFloat("_AlphaClip") > 0.5f)
+                || mat.IsKeywordEnabled("_ALPHATEST_ON")
+                || (mat.HasProperty("_Surface") && mat.GetFloat("_Surface") > 0.5f)
+                || mat.GetTag("RenderType", false) == "Transparent"
+                || (mat.HasProperty("_SmoothnessTextureChannel") && mat.GetFloat("_SmoothnessTextureChannel") > 0.5f)
+                || mat.IsKeywordEnabled("_SMOOTHNESS_TEXTURE_ALBEDO_CHANNEL_A");
+            if (!needsAlpha) return;
 
             Texture texture = mat.GetTexture(property);
             if (texture == null) return;
@@ -473,19 +519,40 @@ namespace Ntc.UnityEditorTools
             string assetPath = AssetDatabase.GetAssetPath(texture);
             if (string.IsNullOrEmpty(assetPath)) return;
             AddTextureRef(entry, assetPath, spec, channelSwizzle);
+            if (spec.OutName == "Color")
+            {
+                var importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+                if (importer != null) entry.textures[entry.textures.Count - 1].isSrgb = importer.sRGBTexture;
+            }
         }
 
         static void AddTextureRef(MaterialEntry entry, string assetPath, TextureSpec spec, string channelSwizzle)
         {
             entry.textures.Add(new TextureRef
             {
-                sourcePath = Path.GetFullPath(assetPath),
+                sourcePath = ResolveSourceAssetPath(assetPath),
                 outName = spec.OutName,
                 isSrgb = spec.IsSrgb,
                 bcFormat = spec.BcFormat,
                 semantic = spec.Semantic,
                 channelSwizzle = channelSwizzle
             });
+        }
+
+        public static string ResolveSourceAssetPath(string assetPath)
+        {
+            if (string.IsNullOrWhiteSpace(assetPath)) throw new ArgumentException("Source asset path is required.", nameof(assetPath));
+            string normalized = assetPath.Replace('\\', '/');
+            if (normalized.StartsWith("Packages/", StringComparison.Ordinal))
+            {
+                var package = UnityEditor.PackageManager.PackageInfo.FindForAssetPath(normalized);
+                if (package == null) throw new FileNotFoundException("Cannot resolve source asset package", assetPath);
+                string prefix = package.assetPath.TrimEnd('/') + "/";
+                if (!normalized.StartsWith(prefix, StringComparison.Ordinal))
+                    throw new ArgumentException("Source asset is outside its resolved package.", nameof(assetPath));
+                return Path.GetFullPath(Path.Combine(package.resolvedPath, normalized.Substring(prefix.Length)));
+            }
+            return Path.GetFullPath(assetPath);
         }
 
         void TryFindTexturesByConvention(MaterialEntry entry)
@@ -527,9 +594,23 @@ namespace Ntc.UnityEditorTools
 
         void CheckBakeStatus(MaterialEntry entry)
         {
-            entry.ntcPath = Path.Combine(_outputDir, entry.materialName + ".ntc");
-            if (!File.Exists(entry.ntcPath) && !string.IsNullOrEmpty(_ntcFilePrefix))
-                entry.ntcPath = Path.Combine(_outputDir, _ntcFilePrefix + entry.materialName + ".ntc");
+            var binding = entry.sourceMaterial != null ? NtcTextureSetAssetEditor.Find(entry.sourceMaterial) : null;
+            entry.ntcPath = binding != null ? binding.ResolveDataPath() : Path.Combine(_outputDir, entry.stableId + ".ntc");
+            // An explicit binding is authoritative even when broken; never silently consume
+            // an unrelated same-name legacy bake in that case.
+            if (binding == null && !File.Exists(entry.ntcPath))
+            {
+                if (_entries.Exists(other => other != entry && other.sourceMaterial != entry.sourceMaterial && other.materialName == entry.materialName))
+                {
+                    entry.hasNtc = false;
+                    entry.ntcSize = 0;
+                    entry.status = "same-name legacy bake is ambiguous; bind explicitly";
+                    return;
+                }
+                entry.ntcPath = Path.Combine(_outputDir, entry.materialName + ".ntc");
+                if (!File.Exists(entry.ntcPath) && !string.IsNullOrEmpty(_ntcFilePrefix))
+                    entry.ntcPath = Path.Combine(_outputDir, _ntcFilePrefix + entry.materialName + ".ntc");
+            }
 
             entry.hasNtc = File.Exists(entry.ntcPath);
             entry.ntcSize = entry.hasNtc ? new FileInfo(entry.ntcPath).Length : 0;
@@ -565,21 +646,38 @@ namespace Ntc.UnityEditorTools
             if (_baking) return;
             if (toBake == null || toBake.Count == 0)
             {
-                EditorUtility.DisplayDialog("NTC Bake", "No materials selected (or selected materials have fewer than 2 source textures).", "OK");
+                EditorUtility.DisplayDialog("NTC Bake", "Select at least one persistent material with a source texture.", "OK");
                 return;
             }
-            if (!File.Exists(_ntcCliPath))
+            string resolvedCli = ResolveExecutable(_ntcCliPath);
+            if (resolvedCli == null)
             {
                 EditorUtility.DisplayDialog("NTC Bake", "ntc-cli not found:\n" + _ntcCliPath, "OK");
                 return;
             }
 
-            string ntcCli = _ntcCliPath;
-            string python = string.IsNullOrEmpty(_pythonPath) ? "python" : _pythonPath;
-            string outputDir = _outputDir;
+            string ntcCli = resolvedCli;
+            string python = ResolveExecutable(string.IsNullOrEmpty(_pythonPath) ? "python" : _pythonPath);
+            if (python == null || string.IsNullOrWhiteSpace(_outputDir) || float.IsNaN(_bpp) || _bpp < 1 || _bpp > 20
+                || float.IsNaN(_metalLossScale) || float.IsInfinity(_metalLossScale) || _metalLossScale <= 0
+                || float.IsNaN(_smoothLossScale) || float.IsInfinity(_smoothLossScale) || _smoothLossScale <= 0)
+            {
+                EditorUtility.DisplayDialog("NTC Bake", "Check Python, output directory, bpp (1..20), and positive finite loss weights.", "OK");
+                return;
+            }
+            string outputDir = Path.GetFullPath(_outputDir);
             float bpp = _bpp;
             float metalLossScale = _metalLossScale;
             float smoothLossScale = _smoothLossScale;
+            var jobs = new List<BakeJob>();
+            foreach (MaterialEntry entry in toBake)
+            {
+                var job = new BakeJob { materialName = entry.materialName, stableId = NtcTextureSetAssetEditor.StableId(entry.sourceMaterial), trainingSteps = Math.Max(_trainingSteps,1) };
+                foreach (TextureRef texture in entry.textures)
+                    job.textures.Add(new TextureRef { sourcePath = texture.sourcePath, outName = texture.outName,
+                        isSrgb = texture.isSrgb, bcFormat = texture.bcFormat, semantic = texture.semantic, channelSwizzle = texture.channelSwizzle });
+                jobs.Add(job);
+            }
 
             lock (_stateLock)
             {
@@ -590,21 +688,37 @@ namespace Ntc.UnityEditorTools
                 _baking = true;
             }
 
-            _bakeTask = Task.Run(() => BakeQueueWorker(toBake, ntcCli, python, outputDir, bpp, metalLossScale, smoothLossScale));
+            _bakeTask = Task.Run(() => BakeQueueWorker(jobs, ntcCli, python, outputDir, bpp, metalLossScale, smoothLossScale));
         }
 
-        void BakeQueueWorker(List<MaterialEntry> toBake, string ntcCli, string python, string outputDir, float bpp, float metalLossScale, float smoothLossScale)
+        public static string ResolveExecutable(string executable)
+        {
+            if (string.IsNullOrWhiteSpace(executable)) return null;
+            if (File.Exists(executable)) return Path.GetFullPath(executable);
+            if (Path.IsPathRooted(executable) || executable.IndexOfAny(new[] { '/', '\\' }) >= 0) return null;
+            foreach (string directory in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+                foreach (string suffix in new[] { "", ".exe", ".cmd", ".bat" })
+                {
+                    string path = Path.Combine(directory.Trim('"'), executable + suffix);
+                    if (File.Exists(path) && (suffix == "" || suffix == ".exe")) return path;
+                }
+            return null;
+        }
+
+        void BakeQueueWorker(List<BakeJob> toBake, string ntcCli, string python, string outputDir, float bpp, float metalLossScale, float smoothLossScale)
         {
             int done = 0;
+            int failed = 0;
             try
             {
                 for (int i = 0; i < toBake.Count; i++)
                 {
-                    BakeSingleWorker(toBake[i], i, toBake.Count, ntcCli, python, outputDir, bpp, metalLossScale, smoothLossScale);
+                    try { BakeSingleWorker(toBake[i], i, toBake.Count, ntcCli, python, outputDir, bpp, metalLossScale, smoothLossScale); }
+                    catch (Exception error) { failed++; SetBakeError(toBake[i].materialName + ": " + error.Message); AppendBakeLog("FAILED: " + error); }
                     done++;
                     SetBakeProgress((float)done / Math.Max(toBake.Count, 1), "Completed " + done + "/" + toBake.Count);
                 }
-                SetBakeProgress(1f, "Done. Baked " + done + "/" + toBake.Count + " materials.");
+                SetBakeProgress(1f, "Processed " + done + ": " + (done - failed) + " compressed, " + failed + " failed. Successful files await main-thread binding.");
             }
             catch (Exception e)
             {
@@ -618,15 +732,13 @@ namespace Ntc.UnityEditorTools
             }
         }
 
-        void BakeSingleWorker(MaterialEntry entry, int index, int total, string ntcCli, string python, string outputDir, float bpp, float metalLossScale, float smoothLossScale)
+        void BakeSingleWorker(BakeJob entry, int index, int total, string ntcCli, string python, string outputDir, float bpp, float metalLossScale, float smoothLossScale)
         {
-            string tempDir = Path.Combine(Path.GetTempPath(), "ntc_bake_" + SanitizeFileName(entry.materialName));
-            if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+            string tempDir = Path.Combine(Path.GetTempPath(), "ntc_bake_" + entry.stableId + "_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(tempDir);
 
             try
             {
-                entry.status = "converting";
                 UpdateMaterialProgress(index, total, 0.02f, entry.materialName + ": converting source textures...");
                 var convertedTextures = new List<TextureRef>();
                 foreach (TextureRef tex in entry.textures)
@@ -636,49 +748,43 @@ namespace Ntc.UnityEditorTools
                     else
                         AppendBakeLog("WARNING: " + entry.materialName + " skipped missing channel for " + tex.outName + " (" + tex.channelSwizzle + ")");
                 }
-                if (convertedTextures.Count < 2)
+                if (convertedTextures.Count < 1)
                 {
-                    entry.status = "skipped: not enough channels";
-                    UpdateMaterialProgress(index, total, 1f, entry.materialName + ": skipped (not enough source textures after missing-channel filtering)");
-                    return;
+                    throw new InvalidOperationException("No source textures remain after missing-channel filtering.");
                 }
 
-                entry.status = "manifest";
                 string manifestPath = Path.Combine(tempDir, "Manifest.json");
                 WriteManifestFile(manifestPath, convertedTextures, metalLossScale, smoothLossScale);
 
-                entry.status = "compressing";
-                string ntcOutput = Path.Combine(outputDir, (_ntcFilePrefix ?? "") + entry.materialName + ".ntc");
+                string ntcOutput = Path.Combine(tempDir, entry.stableId + ".ntc");
                 Directory.CreateDirectory(outputDir);
-                string args = "--loadManifest \"" + manifestPath + "\" -g -c -b " + bpp.ToString(CultureInfo.InvariantCulture) + " --gdeflate off -D -o \"" + ntcOutput + "\"";
+                string args = "--loadManifest \"" + manifestPath + "\" -g -c -S " + entry.trainingSteps + " -b " + bpp.ToString(CultureInfo.InvariantCulture) + " --gdeflate off -D -o \"" + ntcOutput + "\"";
                 string stdout = RunProcessStreaming(ntcCli, args, line =>
                 {
                     AppendBakeLog(line);
                     int step = TryParseTrainingStep(line);
                     if (step >= 0)
                     {
-                        float local = Clamp01(step / 100000f) * 0.80f + 0.10f;
-                        UpdateMaterialProgress(index, total, local, entry.materialName + ": training " + step + "/100000...");
+                        float local = Clamp01(step / (float)entry.trainingSteps) * 0.80f + 0.10f;
+                        UpdateMaterialProgress(index, total, local, entry.materialName + ": training " + step + "/" + entry.trainingSteps + "...");
                     }
                 });
-                entry.psnr = ExtractPsnr(stdout);
-
-                entry.status = "decompressing";
+                NtcAssetBuilder.ValidateInferenceModel(NtcContainerReader.Load(ntcOutput));
                 UpdateMaterialProgress(index, total, 0.92f, entry.materialName + ": decompressing preview PNGs...");
                 string decompDir = Path.Combine(outputDir, "Decompressed", Path.GetFileNameWithoutExtension(ntcOutput));
                 Directory.CreateDirectory(decompDir);
                 args = "--loadCompressed \"" + ntcOutput + "\" -D -i \"" + decompDir + "\" -F png -B none";
                 RunProcessStreaming(ntcCli, args, AppendBakeLog);
 
-                CheckBakeStatus(entry);
-                UpdateMaterialProgress(index, total, 1f, entry.materialName + ": baked OK (" + FormatMB(entry.ntcSize) + ")");
-                UnityEngine.Debug.Log("[NTC Bake] " + entry.materialName + ": " + entry.psnr + " dB, " + FormatMB(entry.ntcSize));
-            }
-            catch (Exception e)
-            {
-                entry.status = "ERROR";
-                SetBakeError(entry.materialName + ": " + e.Message);
-                UnityEngine.Debug.LogError("[NTC Bake] " + entry.materialName + " failed: " + e);
+                string finalPath = Path.Combine(outputDir, entry.stableId + ".ntc");
+                File.Copy(ntcOutput, finalPath, true);
+                NtcTextureSetAssetEditor.QueueCompletedBake(entry.stableId, finalPath, (success, message) =>
+                {
+                    if (!success) SetBakeError(entry.materialName + ": " + message);
+                    AppendBakeLog(entry.materialName + ": " + message);
+                    _pendingRefresh = true;
+                });
+                UpdateMaterialProgress(index, total, 1f, entry.materialName + ": compressed; binding queued (" + ExtractPsnr(stdout) + " dB)");
             }
             finally
             {
@@ -754,10 +860,14 @@ namespace Ntc.UnityEditorTools
 
             string script =
                 "from PIL import Image\n" +
-                "src = r'" + EscapePythonPath(srcPath) + "'\n" +
-                "dst = r'" + EscapePythonPath(outPath) + "'\n" +
+                "import base64\n" +
+                "src = base64.b64decode('" + Convert.ToBase64String(Encoding.UTF8.GetBytes(srcPath)) + "').decode('utf-8')\n" +
+                "dst = base64.b64decode('" + Convert.ToBase64String(Encoding.UTF8.GetBytes(outPath)) + "').decode('utf-8')\n" +
                 "needs_alpha = " + (needsAlpha ? "True" : "False") + "\n" +
                 "img = Image.open(src)\n" +
+                // Indexed PNGs store opacity in palette transparency rather than an A band.
+                "if needs_alpha and 'transparency' in img.info:\n" +
+                "    img = img.convert('RGBA')\n" +
                 // BUG FIX (2026-07-10): Photoshop-exported *_MetallicSmoothness.tif files are
                 // physically 4-sample-per-pixel (RGB + Smoothness packed in the 4th sample), but
                 // Photoshop tags that 4th sample's TIFF ExtraSamples field as UNSPECIFIED (0)
@@ -788,11 +898,6 @@ namespace Ntc.UnityEditorTools
                 "    print('Converted %dx%d %s' % (img.size[0], img.size[1], img.mode))\n";
             string stdout = RunProcessStreaming(python, "-c \"" + script.Replace("\"", "\\\"") + "\"", AppendBakeLog);
             return stdout.IndexOf("NTC_SKIP_TEXTURE", StringComparison.Ordinal) < 0;
-        }
-
-        static string EscapePythonPath(string path)
-        {
-            return path.Replace("'", "\\'");
         }
 
         static string RunProcessStreaming(string exe, string args, Action<string> onLine)

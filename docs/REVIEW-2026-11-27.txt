@@ -1,0 +1,121 @@
+历史记录：这是首轮评审快照，包含当时未构建/未推送等状态。当前以 docs/REVIEW-CURRENT.md 为准。
+
+NTCinUnity 优化评审与本轮迭代结果
+日期：2026-11-27
+源码：G:\Git\NTC Test\unity-plugin
+
+结论
+本轮已完成空白上下文独立审查、修复、回归测试和追加审查。
+修复落在 canonical unity-plugin 中，没有提交或推送 Git，也没有覆盖原有 Showcase 工程配置、同步其 Assets/NtcPlugin 副本或重建已有 Player。
+原工作区已有大量未提交修改；本轮在其基础上修改，没有回退原修改。
+
+一、已修复的确定问题
+
+1. P1：逐像素 fallback 的推理数学不等价。
+   位置：Shaders/NtcInference.hlsl:123、141、149、210。
+   原实现漏了 latent floor、位置编码整型截断、第二个 LOD 输入、隐藏层 round(x*80)-113 量化。
+   已与仓库内 NVIDIA Inference.hlsli 及当前 packed Compute 路径对齐。
+   验证：Bricks/Flagpoles × mip4/mip7 的 GPU RGB readback parity，最大字节误差分别为 1、0、0、0。
+   边界：测试调用共享推理 HLSL 库，并未实际渲染完整 fragment 材质；不能据此声称完整 fallback PBR 画面已验证。
+
+2. P1：源码重新导入后，Compute kernel 可能无法编译，却继续被当成可用。
+   位置：Resources/NtcDecompress.compute:210、260；Runtime/NtcDecompressor.cs:92、221。
+   实测发现 FXC 拒绝 bool 三元表达式作为数组大小。已改为四层显式数组长度 16/12/8/16。
+   IsValid 现在检查 ComputeShader.IsSupported；无效 kernel/输入在 dispatch 前抛错，避免把未执行的工作标成缓存驻留。
+   另修正路径显示：D3D12 API 名称不能证明实际选中了硬件 DP4A 指令，现在标明指令路径尚未验证。
+
+3. P1：URP AO 输入取错通道。
+   位置：Editor/NtcBakeWindow.cs:396。
+   _OcclusionMap 属性读取改为 G；按文件命名约定发现的独立 AO 图仍使用 R。
+   回归测试实际创建 R/G 不同的源图，并检查烘焙收集结果。
+   注意：此前已烘焙且 R/G 不同的 packed AO 数据需要重烘，修改代码不会修复旧 .ntc 内容。
+
+4. P1：材质参数被重置。
+   位置：Runtime/NtcSceneController.cs 的 PNG/Compute 绑定路径。
+   原实现把法线强度和存在光滑度贴图时的系数设为 1；烘焙保存的是原始贴图，因此丢失了源材质乘数。
+   已保留源 _BumpScale 和 _Smoothness，并补绑定回归测试。
+
+5. P1：部分 mask、缺失 alpha 导致材质外观错误。
+   位置：Runtime/NtcSceneController.cs:836、861、893、969、987。
+   仅有 metallic 或 smoothness 时，解压缓存另一分量为零；启用 URP packed map 后，不能靠材质 scalar 自动补回来。
+   需要透明度、Alpha Clip 或 albedo-alpha smoothness 的材质，无 alpha bake 时也不能用 alpha=1 的结果替换 BaseMap。
+   本轮采取兼容回退：保留对应原始 BaseMap/packed mask，不把单个材质默认值写进公共缓存。
+   Compute/tile 控制器状态会显示原图回退原因。
+   已覆盖透明材质、opaque albedo-alpha keyword 和 property 两个分支的回归测试。
+   这能防止损坏画面，但并未实现这些材质的完整 NTC 化，原始贴图仍然需要驻留。
+
+6. P2：normal-only 文件被当成 BaseColor。
+   位置：Runtime/NtcAssetBuilder.cs 的 BuildPbrLayout。
+   已删除“找不到颜色名字就把前三通道当 sRGB 颜色”的无条件猜测；缺少颜色时保留原材质颜色。
+
+7. P2：不兼容模型直接进入固定 shader。
+   位置：Runtime/NtcAssetBuilder.cs:160。
+   新增 GPU 分配前校验：48/64/48/32/16、RowMajor、HGELUClamp、INT8/Float32 scale/Int32 bias、buffer 大小和范围、通道范围、mip 结构及 INT8 LOD 域。
+   追加独立 review 又发现两个遗漏，均已修复：第二个 neural grid 不能落到未上传 mip；LOD 量化必须落在 signed byte 范围。
+   当前 25 个真实 .ntc 均通过该 contract。
+
+8. 稳态 CPU 开销。
+   位置：Runtime/NtcTileStreamer.cs:60、143；Runtime/NtcSceneController.cs:1185。
+   复用 visible list 和 frustum planes；缓存版本未变时不再逐帧重新绑定材质；未曾绑定的 deferred entry 不再逐帧读取/恢复原始 slots。
+   这减少了已确定的分配和重复操作来源；本轮没有测量 FPS/帧耗收益，也没有宣称全路径零 GC。
+
+二、仍然存在的问题与建议，按下一轮优先级排列
+
+P1：资产仍按材质名字关联，重名会串数据或覆盖烘焙结果。
+证据：Editor/NtcBakeWindow.cs 按 entry.materialName 生成 .ntc；SceneController.FindNtcFile 也按材质名字找文件。
+不同材质对象即便已分成独立 slot groups，名字相同仍可能指向同一个 .ntc。
+建议：建立 NtcTextureSet/材质绑定资产，以 GUID 或持久 ID 关联；显示名称只用于 UI；发现重名输出时先拒绝覆盖。
+
+P1：尚无完整 PBR 的直接 on-Sample 接入。
+默认 on-Sample 仍是“Compute 分块解压到普通纹理缓存”。现有直接 fragment shader 仅 BaseColor Unlit，固定 mip0。
+建议：把材质访问收敛到一个 SampleMaterialTextures/LoadMaterialTexel 入口，一次 NTC 推理输出整组材质通道；普通贴图与 NTC 作为两个后端。
+缺失的 metallic/smoothness 等语义在解码之后按当前材质补默认值，避免污染共享的纹理组数据。
+先实现单一 opaque URP Lit metallic 工作流，验证颜色、法线、mask、AO，再增加 alpha clip 和透明流程。
+NTC texel load 不等价于带过滤的 Texture.Sample；需要独立设计导数/mip、过滤及所需的时域重建，不能仅替换一条纹理指令便宣布完成。
+
+P1：显存收益缺少完整账本。
+当前上限只控制解压 cache，不覆盖原始贴图、expanded latent、权重等资源；fallback 又继续依赖原图。
+建议：统计原图、NTC 输入、cache、重复材质资源的总量；设置等质量/等分辨率对照，并记录 fallback 覆盖率。
+只有建立原始贴图可卸载的资源生命周期后，才能验证实际净收益。
+
+P2：源贴图采样设置没有保真。
+证据：Runtime/NtcDecompressor.cs:152-153 固定 Repeat/Bilinear。
+Clamp、Point、各向异性等设置可能变化；不同 map 的 UV/采样约定也不应默认一致。
+建议：资产描述中保存 map 的 wrap/filter/aniso/UV 契约；共享缓存时区分数据共享与采样状态，避免某个材质改动共享 Texture 的状态。
+
+P2：工程迁移和交付路径未完成。
+Showcase Packages/manifest.json 的五个包仍指向旧机器 C:/Users/sunha/...，当前机器这些路径不存在。
+本轮通过独立 UPM 测试宿主解决验证依赖，没有修改 Showcase，也没有把本轮源码同步进其忽略的 Assets 副本。
+建议：统一包源和版本、给出一次可重复的干净构建；UPM 包排除大型示例 NtcData；构建产物附源码 hash，防止旧 exe 与新源码混淆。
+
+P2：GPU 性能路径还需确认。
+API=D3D12 或日志字符串不是硬件 DP4A / Tensor / Cooperative Vector 的指令证据。
+本轮数值正确性测试通过，但 shader 编译器仍可能给出寄存器压力等性能警告。
+建议：检查实际编译指令和 GPU capture，明确 kernel variant；正确性稳定后再比较软件 INT8、DP4A、可用的原生神经推理后端。
+
+三、建议的下一轮可验收里程碑
+
+A. 资产绑定：两份同名但内容不同的材质各有独立数据；重启、构建后仍不串绑。
+B. 直接采样：一个 URP Lit case，一次材质纹理组访问得到全部 PBR 通道；先和 Compute 解码结果做各通道 parity，再比较实际画面。
+C. 过滤与资源：不同 mip/UV/采样状态正确；原始贴图能在 NTC 完全可用后释放；报告总显存和回退比例。
+D. 最后再扩大到透明、复杂材质和跨 API，不用扩大示例场景代替这些验收。
+
+四、本轮验证证据
+
+环境：Unity 2021.3.21f1c1；编辑器随附 URP 12.1.10；RTX 5080；D3D12。
+独立测试宿主：C:\Users\kiiye\Documents\Codex\2026-11-27\c-cha\work\ntc-iteration-tests。
+结果：28 passed / 0 failed / 0 skipped；无 Shader 导入错误或 C# 编译错误。
+GPU parity：Bricks mip4=1/255、mip7=0；Flagpoles mip4=0、mip7=0（RGB 最大绝对字节误差）。
+覆盖：容器、真实 25 文件、material slots、AO、参数、alpha/mask 回退、模型 contract、URP shader 导入、共享推理库 GPU 数值。
+不覆盖：完整 PBR fragment 渲染、过滤质量、完整 Showcase 重新构建、打包后的视觉验收、实际帧率提升。
+
+可重复入口：
+G:\Git\NTC Test\tools\Run-NtcEditModeTests.ps1
+示例：
+& 'G:\Git\NTC Test\tools\Run-NtcEditModeTests.ps1' -UnityEditor 'E:\UnityHub\2021.3.21f1c1\Editor\Unity.exe'
+
+脚本默认创建 build/ntc-review-tests；发现本机编辑器随附 URP，并要求完整测试没有 skipped。
+-CpuOnly 会跳过 GPU checks，不能算完整验收。
+-ProjectPath 必须指向一次性测试工程，因为脚本会重写该宿主的 Packages manifest。
+
+随附 editmode-results.xml、editmode.log 是最终完整测试记录。

@@ -24,7 +24,7 @@
 // arithmetic over those inputs.
 //
 // Network topology (fixed by the .ntc training): 48 -> 64 -> 48 -> 32 -> 16, Int8 weights,
-// HGELUClamp activation, ColumnMajor layout (the DP4A / MLP version 0 path).
+// HGELUClamp activation, RowMajor layout (the DP4A / MLP version 0 path).
 
 #ifndef NTC_INFERENCE_INCLUDED
 #define NTC_INFERENCE_INCLUDED
@@ -120,7 +120,7 @@ void NtcSampleLatentGrid(
         // Texture2DArray is a plain RGBA32 built by NtcAssetBuilder with nibbles already in physical
         // (r=nibble0, g=nibble1, b=nibble2, a=nibble3) order, so re-applying .bgra (needed only when
         // sampling a real hardware BGRA4_UNORM texture) would incorrectly swap nibble0<->nibble2.
-        sampledValue = mask ? sampledValue * (2.0 * c_InputScale) - c_InputScale - 0.5 : 0.0;
+        sampledValue = mask ? floor(sampledValue * (2.0 * c_InputScale) - c_InputScale - 0.5) : 0.0;
 
         networkInputs[featureOffset + layerIndex * 4 + 0] = sampledValue.x;
         networkInputs[featureOffset + layerIndex * 4 + 1] = sampledValue.y;
@@ -138,15 +138,16 @@ void NtcEncodeSamplePosition(
     for (int wave = 0; wave < NTC_MLP_POS_ENC_WAVES; ++wave)
     {
         float4 enc = NtcEvaluatePositionalEncoding(posf);
-        networkInputs[idx + 0] = enc.x * c_InputScale;
-        networkInputs[idx + 1] = enc.y * c_InputScale;
-        networkInputs[idx + 2] = enc.z * c_InputScale;
-        networkInputs[idx + 3] = enc.w * c_InputScale;
+        int4 quantized = int4(enc * c_InputScale);
+        networkInputs[idx + 0] = quantized.x;
+        networkInputs[idx + 1] = quantized.y;
+        networkInputs[idx + 2] = quantized.z;
+        networkInputs[idx + 3] = quantized.w;
         idx += 4;
         posf *= 2.0;
     }
     networkInputs[idx + 0] = int(lod * c_InputScale);
-    networkInputs[idx + 1] = 0.0;
+    networkInputs[idx + 1] = networkInputs[idx + 0];
     networkInputs[idx + 2] = 0.0;
     networkInputs[idx + 3] = 0.0;
 }
@@ -206,7 +207,8 @@ void FuncName(                                                                  
         }                                                                                 \
         else                                                                              \
         {                                                                                 \
-            results = NtcHGELUClamp_ForwardFloat(results);                                \
+            results = round(NtcHGELUClamp_ForwardFloat(results) * float(NTC_HGELU_INVSTEP)) \
+                + float(NTC_HGELU_BIAS);                                                 \
             outputArray[col + 0] = results.x;                                             \
             outputArray[col + 1] = results.y;                                             \
             outputArray[col + 2] = results.z;                                             \

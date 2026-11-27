@@ -1,0 +1,19 @@
+name: Source package
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Export clean Unity package
+        shell: pwsh
+        run: ./tools/Export-NtcPackage.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NTC-Unity-source-package
+          path: build/NTC-Unity-*.zip
+          if-no-files-found: error

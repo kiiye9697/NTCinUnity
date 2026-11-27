@@ -1,0 +1,39 @@
+// Exercise the same portable inference library used by the fragment fallback.
+#pragma kernel CompareInference
+#pragma use_dxc
+#include "../../Shaders/NtcInference.hlsl"
+
+Texture2DArray _Latents;
+SamplerState sampler_linear_repeat;
+ByteAddressBuffer _Weights;
+RWTexture2D<float4> _Output;
+int4 _ImageInfo;
+int4 _ColorMip;
+int4 _WeightOffsets, _ScaleOffsets, _BiasOffsets;
+int4 _Channels;
+int _Mip;
+
+[numthreads(8, 8, 1)]
+void CompareInference(uint2 pixel : SV_DispatchThreadID)
+{
+    int2 size = max(_ImageInfo.xy >> _Mip, 1);
+    if (any(pixel >= uint2(size))) return;
+    NtcTextureSetConstants desc = (NtcTextureSetConstants)0;
+    desc.imageWidth = _ImageInfo.x;
+    desc.imageHeight = _ImageInfo.y;
+    desc.imageMips = _ImageInfo.z;
+    desc.colorMips[_Mip] = _ColorMip;
+    desc.networkWeightOffsets = _WeightOffsets;
+    desc.networkScaleOffsets = _ScaleOffsets;
+    desc.networkBiasOffsets = _BiasOffsets;
+    float values[NTC_MLP_OUTPUT_CHANNELS];
+    bool ok = NtcSampleTextureSet(desc, _Latents, sampler_linear_repeat, _Weights, 0, int2(pixel), _Mip, false, values);
+    float3 rgb = saturate(float3(values[_Channels.x], values[_Channels.y], values[_Channels.z]));
+    if (_Channels.w != 0)
+    {
+        rgb.x = rgb.x <= 0.04045 ? rgb.x / 12.92 : pow((rgb.x + 0.055) / 1.055, 2.4);
+        rgb.y = rgb.y <= 0.04045 ? rgb.y / 12.92 : pow((rgb.y + 0.055) / 1.055, 2.4);
+        rgb.z = rgb.z <= 0.04045 ? rgb.z / 12.92 : pow((rgb.z + 0.055) / 1.055, 2.4);
+    }
+    _Output[int2(pixel.x, size.y - 1 - pixel.y)] = ok ? float4(rgb, 1) : float4(1, 0, 1, 1);
+}

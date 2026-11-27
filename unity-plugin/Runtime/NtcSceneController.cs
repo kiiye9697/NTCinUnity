@@ -16,10 +16,47 @@ using Ntc.Packing;
 
 namespace Ntc.Unity
 {
+    // Runtime-only slot metadata deliberately lives outside NtcSceneController and
+    // MaterialGroup. Keeping it in a static registry preserves the serialized type tree, so
+    // an updated managed assembly remains compatible with Players/scenes built before
+    // multi-submesh support was added.
+    internal struct NtcMaterialSlotBinding
+    {
+        public Renderer Renderer;
+        public int MaterialIndex;
+
+        public NtcMaterialSlotBinding(Renderer renderer, int materialIndex)
+        {
+            Renderer = renderer;
+            MaterialIndex = materialIndex;
+        }
+    }
+
+    internal static class NtcMaterialSlotRegistry
+    {
+        static readonly Dictionary<NtcSceneController.MaterialGroup, NtcMaterialSlotBinding[]> s_Bindings
+            = new Dictionary<NtcSceneController.MaterialGroup, NtcMaterialSlotBinding[]>();
+
+        public static void Set(NtcSceneController.MaterialGroup group, NtcMaterialSlotBinding[] bindings)
+        {
+            if (group != null) s_Bindings[group] = bindings ?? Array.Empty<NtcMaterialSlotBinding>();
+        }
+
+        public static bool TryGet(NtcSceneController.MaterialGroup group, out NtcMaterialSlotBinding[] bindings)
+        {
+            return s_Bindings.TryGetValue(group, out bindings);
+        }
+
+        public static void Remove(NtcSceneController.MaterialGroup group)
+        {
+            if (group != null) s_Bindings.Remove(group);
+        }
+    }
+
     [DisallowMultipleComponent]
     public class NtcSceneController : MonoBehaviour
     {
-        public enum NtcMode { Original = 0, InferenceOnLoad = 1, InferenceOnSample = 2 }
+        public enum NtcMode { Original = 0, InferenceOnLoad = 1, InferenceOnSample = 2, InferenceOnSampleDirect = 3 }
         public enum NtcViewMode { Lit = 0, BaseColor = 1, Normal = 2, Metallic = 3, Roughness = 4 }
 
         [Serializable]
@@ -27,6 +64,8 @@ namespace Ntc.Unity
         {
             public string name;
             public Renderer[] renderers;
+            public NtcTextureSetAsset textureSet;
+            public NtcRendererSlot[] slots = Array.Empty<NtcRendererSlot>();
             public string ntcFilePath = "";   // relative to Assets/, e.g. "NtcPlugin/NtcData/Arches.ntc"
             public Texture2D ntcColor, ntcNormal, ntcMetalness, ntcAO, ntcSmoothness, ntcAlpha;
 
@@ -41,6 +80,7 @@ namespace Ntc.Unity
             [NonSerialized] public bool onSampleLoadAttempted;
             [NonSerialized] public Texture2D metallicGlossMap;
             [NonSerialized] public Texture2D colorWithAlphaMap;   // legacy-PNG-path: Color.png RGB + Alpha.png R merged
+            [NonSerialized] public bool ownsNtcColor, ownsNtcNormal, ownsNtcMetalness, ownsNtcAO, ownsNtcSmoothness, ownsNtcAlpha;
             [NonSerialized] public string status;
 
             // compute-decompress runtime state
@@ -59,6 +99,16 @@ namespace Ntc.Unity
         [Header("Material Groups")]
         [Tooltip("If empty, auto-scans the scene on Start for all renderers and maps them by material name.")]
         public MaterialGroup[] groups = Array.Empty<MaterialGroup>();
+        public NtcTextureSetAsset[] textureSets = Array.Empty<NtcTextureSetAsset>();
+        [Tooltip("Release unreferenced original textures after direct NTC is ready. Requires generated binding assets with a Resources recovery material.")]
+        public bool releaseOriginalTextures;
+        public Shader directSampleShader;
+        public bool OriginalsReleased { get; private set; }
+        public bool IsReady => _initialized && !_applyingMode;
+        public NtcMemorySnapshot MemorySnapshot => NtcMemoryAccounting.Capture(groups, _originalTextureIds);
+        readonly HashSet<int> _originalTextureIds = new HashSet<int>();
+        NtcMemorySnapshot _displayMemory;
+        float _nextMemorySample;
 
         [Header("Settings")]
         public Shader onSampleShader;
@@ -79,6 +129,11 @@ namespace Ntc.Unity
         public int streamCapResolution = 1024;
         public int streamBudgetTilesPerFrame = 8;
         public float streamEvictSeconds = 5f;
+        public int streamMaxCacheMB
+        {
+            get { return NtcTileStreamer.GlobalMaxCacheMB; }
+            set { NtcTileStreamer.GlobalMaxCacheMB = Mathf.Max(value, 0); }
+        }
 
         NtcDecompressor _decompressor;
         NtcTileStreamer _streamer;
@@ -101,6 +156,7 @@ namespace Ntc.Unity
         bool _showStats = true;
         bool _initialized;
         bool _initializing;
+        Coroutine _initializeRoutine;
         float _loadProgress;
         string _loadStatus = "Not started";
 
@@ -109,6 +165,7 @@ namespace Ntc.Unity
         // never blocks the main thread for multiple seconds (the old "freeze" on switching).
         Coroutine _applyRoutine;
         bool _applyingMode;
+        NtcMode _lastAppliedMode = NtcMode.Original;
         float _applyProgress;
         string _applyStatus = "";
         int _bakedNtcGroups;
@@ -119,7 +176,9 @@ namespace Ntc.Unity
         void OnEnable()
         {
             if (!_initialized && !_initializing)
-                StartCoroutine(InitializeRoutine());
+                _initializeRoutine = StartCoroutine(InitializeRoutine());
+            else if (_initialized)
+                StartApplyMode(mode);
         }
 
         void Start()
@@ -217,9 +276,10 @@ namespace Ntc.Unity
                             CapResolution = Mathf.Max(streamCapResolution, 128),
                             BudgetTilesPerFrame = Mathf.Max(streamBudgetTilesPerFrame, 1),
                             EvictAfterSeconds = Mathf.Max(streamEvictSeconds, 0f),
+                            MaxCacheBytes = (long)Mathf.Max(streamMaxCacheMB, 0) * 1024L * 1024L,
                         };
-                        Debug.Log("[NTC] Compute decompressor ready (DP4A hardware capable: "
-                            + NtcDecompressor.Dp4aHardwareSupported + ").");
+                        Debug.Log("[NTC] Compute decompressor ready; active inference path: "
+                            + NtcDecompressor.ActualComputePath + ".");
                     }
                     else
                     {
@@ -236,6 +296,7 @@ namespace Ntc.Unity
                 _initError = e.Message;
                 _loadStatus = "NTC scan failed";
                 _initializing = false;
+                _initializeRoutine = null;
                 Debug.LogError("[NTC] Init failed: " + e);
             }
 
@@ -271,6 +332,7 @@ namespace Ntc.Unity
 
             _initialized = true;
             _initializing = false;
+            _initializeRoutine = null;
             _loadStatus = string.Format("NTC bake check: {0} baked, {1} GPU-loaded, {2} failed, {3} total", _bakedNtcGroups, _loadedNtcGroups, _failedNtcGroups, groups != null ? groups.Length : 0);
             StartApplyMode(mode);
         }
@@ -290,7 +352,10 @@ namespace Ntc.Unity
 
         void AutoScanScene()
         {
-            var byMat = new Dictionary<string, List<Renderer>>();
+            if (groups != null)
+                for (int i = 0; i < groups.Length; i++)
+                    NtcMaterialSlotRegistry.Remove(groups[i]);
+            var byMat = new Dictionary<Material, List<NtcMaterialSlotBinding>>();
 #if UNITY_2022_2_OR_NEWER
             Renderer[] all = UnityEngine.Object.FindObjectsByType<Renderer>(FindObjectsSortMode.None);
 #else
@@ -298,21 +363,36 @@ namespace Ntc.Unity
 #endif
             foreach (Renderer r in all)
             {
-                Material m = r.sharedMaterial;
-                if (m == null) continue;
-                string key = m.name;
-                if (!byMat.ContainsKey(key)) byMat[key] = new List<Renderer>();
-                byMat[key].Add(r);
+                Material[] materials = r.sharedMaterials;
+                for (int materialIndex = 0; materialIndex < materials.Length; materialIndex++)
+                {
+                    Material m = materials[materialIndex];
+                    if (m == null) continue;
+                    List<NtcMaterialSlotBinding> bindings;
+                    if (!byMat.TryGetValue(m, out bindings))
+                    {
+                        bindings = new List<NtcMaterialSlotBinding>();
+                        byMat.Add(m, bindings);
+                    }
+                    bindings.Add(new NtcMaterialSlotBinding(r, materialIndex));
+                }
             }
 
             var list = new List<MaterialGroup>();
             foreach (var kv in byMat)
             {
+                var uniqueRenderers = new List<Renderer>();
+                for (int i = 0; i < kv.Value.Count; i++)
+                    if (!uniqueRenderers.Contains(kv.Value[i].Renderer))
+                        uniqueRenderers.Add(kv.Value[i].Renderer);
                 var g = new MaterialGroup
                 {
-                    name = kv.Key,
-                    renderers = kv.Value.ToArray()
+                    name = kv.Key.name,
+                    renderers = uniqueRenderers.ToArray(),
+                    textureSet = FindTextureSet(kv.Key),
+                    slots = kv.Value.ConvertAll(b => new NtcRendererSlot { renderer = b.Renderer, materialIndex = b.MaterialIndex }).ToArray()
                 };
+                NtcMaterialSlotRegistry.Set(g, kv.Value.ToArray());
                 // Check .ntc bake status right away (also in Edit mode), so the Inspector /
                 // NTC/Rescan Scene Materials reflect real bake state without needing Play.
                 CheckNtcFile(g);
@@ -329,6 +409,14 @@ namespace Ntc.Unity
         /// </summary>
         void CheckNtcFile(MaterialGroup g)
         {
+            if (g.textureSet != null)
+            {
+                string explicitPath = g.textureSet.ResolveDataPath();
+                g.ntcFilePath = MakeRelative(explicitPath);
+                g.hasNtcFile = File.Exists(explicitPath);
+                g.status = g.hasNtcFile ? "bound " + g.textureSet.stableId : "binding data missing: " + explicitPath;
+                return; // An explicit broken binding must never silently select a namesake.
+            }
             string dataAbs = ToAbsolute(ntcDataPath);
             string ntcPath = FindNtcFile(dataAbs, g.name);
             if (ntcPath == null)
@@ -348,12 +436,17 @@ namespace Ntc.Unity
             g.hasNtcData = false;
             g.onSampleLoadAttempted = false;
 
-            // Cache original materials
+            // Cache the original material at every targeted slot. Auto-scan has exact slot
+            // bindings; legacy serialized groups derive them from their renderer list.
             if (g.renderers == null)
                 g.renderers = Array.Empty<Renderer>();
-            g.originalMaterials = new Material[g.renderers.Length];
-            for (int i = 0; i < g.renderers.Length; i++)
-                g.originalMaterials[i] = g.renderers[i] != null ? g.renderers[i].sharedMaterial : null;
+            NtcMaterialSlotBinding[] bindings = GetOrCreateSlotBindings(g);
+            g.originalMaterials = new Material[bindings.Length];
+            for (int i = 0; i < bindings.Length; i++)
+                g.originalMaterials[i] = GetSlotMaterial(bindings[i]);
+            if (g.textureSet == null && g.originalMaterials.Length > 0)
+                g.textureSet = FindTextureSet(g.originalMaterials[0]);
+            NtcMemoryAccounting.RememberTextures(g.originalMaterials, _originalTextureIds);
 
             // Re-check .ntc bake status now (it may have changed since the last Edit-mode scan,
             // e.g. you just baked it in NTC/Bake Window without re-scanning).
@@ -366,7 +459,25 @@ namespace Ntc.Unity
             //   - on-Load  : LoadDecompressedTextures() runs lazily inside ApplyOnLoad
             //   - on-Sample: EnsureOnSampleData() runs lazily inside ApplyOnSample
             // and both are driven one-group-per-frame by ApplyModeRoutine so nothing freezes.
-            g.status = g.hasNtcFile ? "baked (.ntc)" : "not baked";
+            if (g.hasNtcFile) g.status = "baked (.ntc)";
+        }
+
+        NtcTextureSetAsset FindTextureSet(Material source)
+        {
+            if (source == null) return null;
+            string sourceId = source.GetTag("NtcSourceId", false, "");
+            foreach (var binding in textureSets ?? Array.Empty<NtcTextureSetAsset>())
+                if (binding != null && (binding.texturelessTemplate == source || (!string.IsNullOrEmpty(sourceId) && binding.stableId == sourceId))) return binding;
+#if UNITY_EDITOR
+            foreach (var binding in textureSets ?? Array.Empty<NtcTextureSetAsset>())
+                if (binding != null && binding.editorSourceMaterial == source) return binding;
+            foreach (string guid in UnityEditor.AssetDatabase.FindAssets("t:NtcTextureSetAsset"))
+            {
+                var binding = UnityEditor.AssetDatabase.LoadAssetAtPath<NtcTextureSetAsset>(UnityEditor.AssetDatabase.GUIDToAssetPath(guid));
+                if (binding != null && binding.editorSourceMaterial == source) return binding;
+            }
+#endif
+            return null;
         }
 
         string FindNtcFile(string dataDir, string matName)
@@ -397,12 +508,12 @@ namespace Ntc.Unity
             if (!Directory.Exists(decompDir))
                 decompDir = Path.Combine(dataDir, "Decompressed");
 
-            if (g.ntcColor == null)      g.ntcColor = LoadPng(Path.Combine(decompDir, "Color.png"), true);
-            if (g.ntcNormal == null)     g.ntcNormal = LoadPng(Path.Combine(decompDir, "Normal.png"), false);
-            if (g.ntcMetalness == null)  g.ntcMetalness = LoadPng(Path.Combine(decompDir, "Metalness.png"), false);
-            if (g.ntcAO == null)         g.ntcAO = LoadPng(Path.Combine(decompDir, "AO.png"), false);
-            if (g.ntcSmoothness == null) g.ntcSmoothness = LoadPng(Path.Combine(decompDir, "Smoothness.png"), false);
-            if (g.ntcAlpha == null)      g.ntcAlpha = LoadPng(Path.Combine(decompDir, "Alpha.png"), false);
+            if (g.ntcColor == null)      { g.ntcColor = LoadPng(Path.Combine(decompDir, "Color.png"), true); g.ownsNtcColor = g.ntcColor != null; }
+            if (g.ntcNormal == null)     { g.ntcNormal = LoadPng(Path.Combine(decompDir, "Normal.png"), false); g.ownsNtcNormal = g.ntcNormal != null; }
+            if (g.ntcMetalness == null)  { g.ntcMetalness = LoadPng(Path.Combine(decompDir, "Metalness.png"), false); g.ownsNtcMetalness = g.ntcMetalness != null; }
+            if (g.ntcAO == null)         { g.ntcAO = LoadPng(Path.Combine(decompDir, "AO.png"), false); g.ownsNtcAO = g.ntcAO != null; }
+            if (g.ntcSmoothness == null) { g.ntcSmoothness = LoadPng(Path.Combine(decompDir, "Smoothness.png"), false); g.ownsNtcSmoothness = g.ntcSmoothness != null; }
+            if (g.ntcAlpha == null)      { g.ntcAlpha = LoadPng(Path.Combine(decompDir, "Alpha.png"), false); g.ownsNtcAlpha = g.ntcAlpha != null; }
         }
 
         static Texture2D LoadPng(string path, bool sRGB)
@@ -437,13 +548,23 @@ namespace Ntc.Unity
                 }
             }
 
-            g.metallicGlossMap = new Texture2D(width, height, TextureFormat.RGBA32, true, true);
-            g.metallicGlossMap.name = g.name + " NTC MetallicSmoothness";
-            g.metallicGlossMap.wrapMode = TextureWrapMode.Repeat;
-            g.metallicGlossMap.filterMode = FilterMode.Bilinear;
-            g.metallicGlossMap.SetPixels32(packed);
-            g.metallicGlossMap.Apply(true, false);
-            return g.metallicGlossMap;
+            Texture2D result = null;
+            try
+            {
+                result = new Texture2D(width, height, TextureFormat.RGBA32, true, true);
+                result.name = g.name + " NTC MetallicSmoothness";
+                result.wrapMode = TextureWrapMode.Repeat;
+                result.filterMode = FilterMode.Bilinear;
+                result.SetPixels32(packed);
+                result.Apply(true, false);
+                g.metallicGlossMap = result;
+                return result;
+            }
+            catch
+            {
+                DestroyUnityObject(result);
+                throw;
+            }
         }
 
         // Legacy-PNG on-Load path only (compute path writes alpha directly into the RenderTexture
@@ -473,13 +594,23 @@ namespace Ntc.Unity
                 }
             }
 
-            g.colorWithAlphaMap = new Texture2D(width, height, TextureFormat.RGBA32, true, false);
-            g.colorWithAlphaMap.name = g.name + " NTC ColorWithAlpha";
-            g.colorWithAlphaMap.wrapMode = TextureWrapMode.Repeat;
-            g.colorWithAlphaMap.filterMode = FilterMode.Bilinear;
-            g.colorWithAlphaMap.SetPixels32(packed);
-            g.colorWithAlphaMap.Apply(true, false);
-            return g.colorWithAlphaMap;
+            Texture2D result = null;
+            try
+            {
+                result = new Texture2D(width, height, TextureFormat.RGBA32, true, false);
+                result.name = g.name + " NTC ColorWithAlpha";
+                result.wrapMode = TextureWrapMode.Repeat;
+                result.filterMode = FilterMode.Bilinear;
+                result.SetPixels32(packed);
+                result.Apply(true, false);
+                g.colorWithAlphaMap = result;
+                return result;
+            }
+            catch
+            {
+                DestroyUnityObject(result);
+                throw;
+            }
         }
 
         static Color32[] SafeGetPixels(Texture2D tex)
@@ -527,6 +658,9 @@ namespace Ntc.Unity
         {
             if (groups == null) return;
             foreach (var g in groups)
+                if (g != null) ApplyOriginal(g);
+            ReleaseResourcesForMode(m);
+            foreach (var g in groups)
             {
                 if (g == null) continue;
                 ApplyOne(g, m);
@@ -539,14 +673,28 @@ namespace Ntc.Unity
             _applyProgress = 0f;
             int total = groups != null ? groups.Length : 0;
 
-            // Fast, always-safe first step: revert everything to Original immediately so the scene
-            // is never left showing a half-applied state while heavy modes stream in group by group.
-            if (m != NtcMode.Original)
+            // Revert first so no renderer references a cache while it is released below. Then
+            // discard resources that are mutually exclusive with the destination mode.
+            if (groups != null)
             {
                 _applyStatus = "Switching to " + m + " ...";
-                if (groups != null)
-                    foreach (var g in groups)
-                        if (g != null) ApplyOriginal(g);
+                bool originalsReady = true;
+                try
+                {
+                    // Load every recovery material before changing a renderer or releasing NTC.
+                    foreach (var g in groups) if (g != null) EnsureOriginalMaterials(g);
+                }
+                catch (Exception error)
+                {
+                    originalsReady = false;
+                    mode = _lastAppliedMode;
+                    _applyStatus = "Original recovery failed: " + error.Message;
+                    Debug.LogError("[NTC] " + _applyStatus);
+                }
+                if (!originalsReady) { _applyingMode = false; _applyRoutine = null; yield break; }
+                foreach (var g in groups)
+                    if (g != null) ApplyOriginal(g);
+                ReleaseResourcesForMode(m);
                 yield return null;
             }
 
@@ -581,7 +729,10 @@ namespace Ntc.Unity
                 }
             }
 
+            if (m == NtcMode.InferenceOnSampleDirect)
+                yield return ReleaseOriginalsAfterDirectReady();
             _applyStatus = m + " applied";
+            _lastAppliedMode = m;
             _applyingMode = false;
             _applyProgress = 1f;
             _applyRoutine = null;
@@ -598,25 +749,130 @@ namespace Ntc.Unity
                 case NtcMode.Original:          ApplyOriginal(g); break;
                 case NtcMode.InferenceOnLoad:   ApplyOnLoad(g); break;
                 case NtcMode.InferenceOnSample: ApplyOnSample(g); break;
+                case NtcMode.InferenceOnSampleDirect: ApplyOnSampleDirect(g); break;
             }
+        }
+
+        static NtcMaterialSlotBinding[] GetOrCreateSlotBindings(MaterialGroup g)
+        {
+            NtcMaterialSlotBinding[] existing;
+            if (g != null && NtcMaterialSlotRegistry.TryGet(g, out existing))
+                return existing;
+
+            var result = new List<NtcMaterialSlotBinding>();
+            if (g != null && g.slots != null && g.slots.Length > 0)
+            {
+                foreach (NtcRendererSlot slot in g.slots)
+                    if (slot.renderer != null && slot.materialIndex >= 0 && slot.materialIndex < slot.renderer.sharedMaterials.Length)
+                        AddUniqueBinding(result, slot.renderer, slot.materialIndex);
+                existing = result.ToArray();
+                NtcMaterialSlotRegistry.Set(g, existing);
+                return existing;
+            }
+            if (g != null && g.renderers != null)
+            {
+                for (int rendererIndex = 0; rendererIndex < g.renderers.Length; rendererIndex++)
+                {
+                    Renderer renderer = g.renderers[rendererIndex];
+                    if (renderer == null) continue;
+                    Material[] materials = renderer.sharedMaterials;
+                    bool foundNamedSlot = false;
+                    for (int materialIndex = 0; materialIndex < materials.Length; materialIndex++)
+                    {
+                        if (!MaterialMatchesLegacyGroup(materials[materialIndex], g)) continue;
+                        AddUniqueBinding(result, renderer, materialIndex);
+                        foundNamedSlot = true;
+                    }
+
+                    // Old serialized data recorded Renderer only. Slot zero was its historical
+                    // meaning, so retain that fallback when a material/group name cannot identify
+                    // a non-zero slot. Exact non-zero recovery is impossible without serialized
+                    // slot metadata; auto-scanned groups do not have this ambiguity.
+                    if (!foundNamedSlot && materials.Length > 0)
+                    {
+                        AddUniqueBinding(result, renderer, 0);
+                        if (materials.Length > 1)
+                            Debug.LogWarning("[NTC] Legacy group '" + g.name + "' could not identify a material slot on '"
+                                + renderer.name + "'; using the backward-compatible slot 0 fallback.", renderer);
+                    }
+                }
+            }
+            existing = result.ToArray();
+            if (g != null) NtcMaterialSlotRegistry.Set(g, existing);
+            return existing;
+        }
+
+        static void AddUniqueBinding(List<NtcMaterialSlotBinding> bindings, Renderer renderer, int materialIndex)
+        {
+            for (int i = 0; i < bindings.Count; i++)
+                if (bindings[i].Renderer == renderer && bindings[i].MaterialIndex == materialIndex)
+                    return;
+            bindings.Add(new NtcMaterialSlotBinding(renderer, materialIndex));
+        }
+
+        static bool MaterialMatchesLegacyGroup(Material material, MaterialGroup group)
+        {
+            if (material == null || group == null) return false;
+            string materialName = NormalizeMaterialName(material.name);
+            string groupName = NormalizeMaterialName(group.name);
+            if (string.Equals(materialName, groupName, StringComparison.OrdinalIgnoreCase)) return true;
+
+            if (!string.IsNullOrEmpty(group.ntcFilePath))
+            {
+                string ntcName = NormalizeMaterialName(Path.GetFileNameWithoutExtension(group.ntcFilePath));
+                if (string.Equals(materialName, ntcName, StringComparison.OrdinalIgnoreCase)
+                    || ntcName.EndsWith(materialName, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        static string NormalizeMaterialName(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+            const string instanceSuffix = " (Instance)";
+            return value.EndsWith(instanceSuffix, StringComparison.Ordinal)
+                ? value.Substring(0, value.Length - instanceSuffix.Length)
+                : value;
+        }
+
+        static Material GetSlotMaterial(NtcMaterialSlotBinding binding)
+        {
+            if (binding.Renderer == null) return null;
+            Material[] materials = binding.Renderer.sharedMaterials;
+            return binding.MaterialIndex >= 0 && binding.MaterialIndex < materials.Length
+                ? materials[binding.MaterialIndex]
+                : null;
+        }
+
+        static void SetSlotMaterial(NtcMaterialSlotBinding binding, Material material)
+        {
+            if (binding.Renderer == null) return;
+            Material[] materials = binding.Renderer.sharedMaterials;
+            if (binding.MaterialIndex < 0 || binding.MaterialIndex >= materials.Length) return;
+            if (materials[binding.MaterialIndex] == material) return;
+            materials[binding.MaterialIndex] = material;
+            binding.Renderer.sharedMaterials = materials;
         }
 
         void ApplyOriginal(MaterialGroup g)
         {
-            if (g.renderers == null || g.originalMaterials == null) return;
-            int count = Mathf.Min(g.renderers.Length, g.originalMaterials.Length);
+            EnsureOriginalMaterials(g);
+            if (g.originalMaterials == null) return;
+            NtcMaterialSlotBinding[] bindings = GetOrCreateSlotBindings(g);
+            int count = Mathf.Min(bindings.Length, g.originalMaterials.Length);
             for (int i = 0; i < count; i++)
-                if (g.renderers[i] != null)
-                    g.renderers[i].sharedMaterial = GetViewMaterial(g, g.originalMaterials[i]);
+                SetSlotMaterial(bindings[i], GetViewMaterial(g, g.originalMaterials[i]));
         }
 
         void RestoreOriginalMaterialRefs(MaterialGroup g)
         {
-            if (g.renderers == null || g.originalMaterials == null) return;
-            int count = Mathf.Min(g.renderers.Length, g.originalMaterials.Length);
+            EnsureOriginalMaterials(g);
+            if (g.originalMaterials == null) return;
+            NtcMaterialSlotBinding[] bindings = GetOrCreateSlotBindings(g);
+            int count = Mathf.Min(bindings.Length, g.originalMaterials.Length);
             for (int i = 0; i < count; i++)
-                if (g.renderers[i] != null)
-                    g.renderers[i].sharedMaterial = g.originalMaterials[i];
+                SetSlotMaterial(bindings[i], g.originalMaterials[i]);
         }
 
         void ApplyOnLoad(MaterialGroup g)
@@ -634,7 +890,10 @@ namespace Ntc.Unity
 
             // Legacy fallback: runtime-decode the pre-baked decompressed PNGs.
             if (g.ntcColor == null && g.ntcNormal == null && g.ntcMetalness == null && g.ntcAO == null)
-                LoadDecompressedTextures(g, ToAbsolute(ntcDataPath));
+            {
+                try { LoadDecompressedTextures(g, ToAbsolute(ntcDataPath)); }
+                catch { ReleaseOnLoadCache(g); throw; }
+            }
 
             if (g.ntcColor == null) { g.status = "no Color.png"; ApplyOriginal(g); return; }
 
@@ -650,7 +909,8 @@ namespace Ntc.Unity
                 // alpha channel here so URP Lit's alpha-clip (which reads BaseMap.a, not a
                 // separate texture slot) actually has real cutout data instead of a constant 1.
                 Texture2D baseMapTex = g.ntcAlpha != null ? MergeAlphaIntoColorMap(g) : g.ntcColor;
-                if (g.onLoadMaterial.HasProperty(kBaseMap)) g.onLoadMaterial.SetTexture(kBaseMap, baseMapTex);
+                if (g.onLoadMaterial.HasProperty(kBaseMap) && (g.ntcAlpha != null || !RequiresBaseAlpha(src)))
+                    g.onLoadMaterial.SetTexture(kBaseMap, baseMapTex);
 
                 if (onLoadSwapAllMaps)
                 {
@@ -662,48 +922,65 @@ namespace Ntc.Unity
                     {
                         g.ntcNormal.wrapMode = TextureWrapMode.Repeat;
                         g.onLoadMaterial.SetTexture(kBumpMap, g.ntcNormal);
-                        g.onLoadMaterial.EnableKeyword("_NORMALMAP");
-                        if (g.onLoadMaterial.HasProperty("_BumpScale")) g.onLoadMaterial.SetFloat("_BumpScale", 1f);
+                        if (g.onLoadMaterial.HasProperty("_BumpScale")) g.onLoadMaterial.SetFloat("_BumpScale", SafeGetFloat(src, "_BumpScale", 1f));
                     }
 
                     if (g.ntcAO != null && g.onLoadMaterial.HasProperty(kOcclusionMap))
                     {
                         g.onLoadMaterial.SetTexture(kOcclusionMap, g.ntcAO);
-                        g.onLoadMaterial.EnableKeyword("_OCCLUSIONMAP");
                     }
 
                     bool haveMetal = g.ntcMetalness != null;
                     bool haveSmooth = g.ntcSmoothness != null;
-                    if (haveMetal || haveSmooth)
+                    // A partial NTC mask cannot replace a packed URP map without losing
+                    // the other source component. Keep the original mask until both exist.
+                    if (haveMetal && haveSmooth)
                     {
                         Texture2D metallicGloss = GetOrCreateMetallicGlossMap(g);
                         if (metallicGloss != null && g.onLoadMaterial.HasProperty(kMetallicGlossMap))
                         {
                             g.onLoadMaterial.SetTexture(kMetallicGlossMap, metallicGloss);
-                            g.onLoadMaterial.EnableKeyword("_METALLICSPECGLOSSMAP");
                             // When a channel is actually driven by the packed map, the scalar multiplier
                             // must be 1. When a channel is MISSING (e.g. cloth has no smoothness map), we
                             // must NOT force it to 1 -- doing so made non-metal cloth render fully smooth
                             // (shiny/plastic). Instead keep the original material's scalar so the look
                             // matches Original as closely as the available maps allow.
                             if (g.onLoadMaterial.HasProperty(kMetallic))
-                                g.onLoadMaterial.SetFloat(kMetallic, haveMetal ? 1f : SafeGetFloat(src, kMetallic, 0f));
+                                g.onLoadMaterial.SetFloat(kMetallic, SafeGetFloat(src, kMetallic, 0f));
                             if (g.onLoadMaterial.HasProperty(kSmoothness))
-                                g.onLoadMaterial.SetFloat(kSmoothness, haveSmooth ? 1f : SafeGetFloat(src, kSmoothness, 0.5f));
+                                g.onLoadMaterial.SetFloat(kSmoothness, SafeGetFloat(src, kSmoothness, 0.5f));
                         }
                     }
                 }
             }
-            if (g.renderers == null) return;
             Material display = GetViewMaterial(g, g.onLoadMaterial);
-            for (int i = 0; i < g.renderers.Length; i++)
-                if (g.renderers[i] != null) g.renderers[i].sharedMaterial = display;
+            AssignGroupMaterial(g, display);
             g.status = "on-Load active";
         }
 
         static float SafeGetFloat(Material m, string prop, float fallback)
         {
             return (m != null && m.HasProperty(prop)) ? m.GetFloat(prop) : fallback;
+        }
+
+        static bool RequiresBaseAlpha(Material material)
+        {
+            return material != null && (SafeGetFloat(material, "_AlphaClip", 0f) > 0.5f
+                || material.IsKeywordEnabled("_ALPHATEST_ON")
+                || SafeGetFloat(material, "_Surface", 0f) > 0.5f
+                || material.GetTag("RenderType", false) == "Transparent"
+                || SafeGetFloat(material, "_SmoothnessTextureChannel", 0f) > 0.5f
+                || material.IsKeywordEnabled("_SMOOTHNESS_TEXTURE_ALBEDO_CHANNEL_A"));
+        }
+
+        static string PbrFallbackNote(Material source, NtcPbrChannelLayout layout)
+        {
+            bool baseFallback = RequiresBaseAlpha(source) && !layout.HasAlpha;
+            bool maskFallback = layout.HasMask && (layout.Metal < 0 || layout.Smooth < 0);
+            if (baseFallback && maskFallback) return "; original BaseMap (alpha absent), original mask (partial bake)";
+            if (baseFallback) return "; original BaseMap (alpha absent)";
+            if (maskFallback) return "; original mask (partial bake)";
+            return "";
         }
 
         // ------------------------------------------------------- compute on-Load (mode2)
@@ -716,16 +993,25 @@ namespace Ntc.Unity
         /// </summary>
         bool ApplyOnLoadCompute(MaterialGroup g)
         {
-            if (!EnsureGpuData(g) || !g.hasPbrLayout)
-                return false;
-
             if (g.onLoadTargets == null)
             {
+                if (!EnsureGpuData(g) || !g.hasPbrLayout)
+                    return false;
                 int w = Mathf.Max(g.assets.Constants.imageWidth, 1);
                 int h = Mathf.Max(g.assets.Constants.imageHeight, 1);
-                g.onLoadTargets = _decompressor.AllocateTargets(w, h, g.pbrLayout, true);
-                _decompressor.DecompressFull(g.assets, g.pbrLayout, g.onLoadTargets, 0);
-                NtcDecompressor.GenerateMips(g.onLoadTargets);
+                NtcDecompressTargets pending = null;
+                try
+                {
+                    pending = _decompressor.AllocateTargets(w, h, g.pbrLayout, true);
+                    _decompressor.DecompressFull(g.assets, g.pbrLayout, pending, 0);
+                    NtcDecompressor.GenerateMips(pending);
+                    g.onLoadTargets = pending;
+                    pending = null;
+                }
+                finally
+                {
+                    if (pending != null) pending.Release();
+                }
             }
 
             Material src = g.originalMaterials != null && g.originalMaterials.Length > 0 ? g.originalMaterials[0] : null;
@@ -735,14 +1021,9 @@ namespace Ntc.Unity
                 g.onLoadMaterial = new Material(src) { name = src.name + " (NTC on-Load compute)" };
             BindPbrTargetsToMaterial(g.onLoadMaterial, src, g.onLoadTargets, g.pbrLayout);
 
-            if (g.renderers != null)
-            {
-                Material display = GetViewMaterial(g, g.onLoadMaterial);
-                for (int i = 0; i < g.renderers.Length; i++)
-                    if (g.renderers[i] != null) g.renderers[i].sharedMaterial = display;
-            }
+            AssignGroupMaterial(g, GetViewMaterial(g, g.onLoadMaterial));
 
-            g.status = "on-Load active (compute)";
+            g.status = "on-Load active (compute)" + PbrFallbackNote(src, g.pbrLayout);
             return true;
         }
 
@@ -757,7 +1038,8 @@ namespace Ntc.Unity
         {
             if (mat == null || t == null) return;
 
-            if (t.BaseColor != null && mat.HasProperty(kBaseMap))
+            // Preserve opacity/cutout/albedo-alpha smoothness when an older bake lacks alpha.
+            if (t.BaseColor != null && mat.HasProperty(kBaseMap) && (layout.HasAlpha || !RequiresBaseAlpha(src)))
                 mat.SetTexture(kBaseMap, t.BaseColor);
 
             if (onLoadSwapAllMaps)
@@ -765,26 +1047,31 @@ namespace Ntc.Unity
                 if (t.Normal != null && mat.HasProperty(kBumpMap))
                 {
                     mat.SetTexture(kBumpMap, t.Normal);
-                    mat.EnableKeyword("_NORMALMAP");
-                    if (mat.HasProperty("_BumpScale")) mat.SetFloat("_BumpScale", 1f);
+                    if (mat.HasProperty("_BumpScale")) mat.SetFloat("_BumpScale", SafeGetFloat(src, "_BumpScale", 1f));
                 }
                 if (t.AO != null && mat.HasProperty(kOcclusionMap))
                 {
                     mat.SetTexture(kOcclusionMap, t.AO);
-                    mat.EnableKeyword("_OCCLUSIONMAP");
                 }
-                if (t.Mask != null && mat.HasProperty(kMetallicGlossMap))
+                // URP ignores the metallic scalar once a packed map is enabled. A cache
+                // shared by different materials cannot encode their missing scalar defaults.
+                if (t.Mask != null && layout.Metal >= 0 && layout.Smooth >= 0 && mat.HasProperty(kMetallicGlossMap))
                 {
                     mat.SetTexture(kMetallicGlossMap, t.Mask);
-                    mat.EnableKeyword("_METALLICSPECGLOSSMAP");
-                    if (mat.HasProperty(kMetallic)) mat.SetFloat(kMetallic, layout.Metal >= 0 ? 1f : SafeGetFloat(src, kMetallic, 0f));
-                    if (mat.HasProperty(kSmoothness)) mat.SetFloat(kSmoothness, layout.Smooth >= 0 ? 1f : SafeGetFloat(src, kSmoothness, 0.5f));
+                    if (mat.HasProperty(kMetallic)) mat.SetFloat(kMetallic, SafeGetFloat(src, kMetallic, 0f));
+                    // Baking stores the raw map; URP still applies the source multiplier.
+                    if (mat.HasProperty(kSmoothness)) mat.SetFloat(kSmoothness, SafeGetFloat(src, kSmoothness, 0.5f));
                 }
             }
         }
 
         Material GetViewMaterial(MaterialGroup g, Material source)
         {
+            if (source != null && source.HasProperty("_NtcDebugView"))
+            {
+                source.SetFloat("_NtcDebugView", (float)viewMode);
+                return source;
+            }
             if (viewMode == NtcViewMode.Lit || source == null)
                 return source;
 
@@ -856,11 +1143,13 @@ namespace Ntc.Unity
                 {
                     AssignGroupMaterial(g, GetViewMaterial(g, g.onLoadMaterial));
                 }
+                else if (mode == NtcMode.InferenceOnSampleDirect && g.onSampleMaterial != null)
+                    AssignGroupMaterial(g, GetViewMaterial(g, g.onSampleMaterial));
                 else if (mode == NtcMode.InferenceOnSample)
                 {
                     string id = string.IsNullOrEmpty(g.ntcFilePath) ? g.name : g.ntcFilePath;
                     NtcTileStreamer.Entry e = _streamer != null ? _streamer.Get(id) : null;
-                    if (g.streamActive && g.streamMaterial != null && e != null && e.targets != null && e.residentCount > 0)
+                    if (g.streamActive && g.streamMaterial != null && e != null && e.IsComplete)
                         AssignGroupMaterial(g, GetViewMaterial(g, g.streamMaterial));
                     else if (g.onSampleMaterial != null)
                         AssignGroupMaterial(g, GetViewMaterial(g, g.onSampleMaterial));
@@ -876,10 +1165,10 @@ namespace Ntc.Unity
 
         static void AssignGroupMaterial(MaterialGroup g, Material material)
         {
-            if (g == null || g.renderers == null || material == null) return;
-            for (int i = 0; i < g.renderers.Length; i++)
-                if (g.renderers[i] != null)
-                    g.renderers[i].sharedMaterial = material;
+            if (g == null || material == null) return;
+            NtcMaterialSlotBinding[] bindings = GetOrCreateSlotBindings(g);
+            for (int i = 0; i < bindings.Length; i++)
+                SetSlotMaterial(bindings[i], material);
         }
 
         /// <summary>Ensure the .ntc container + GPU assets + PBR layout are loaded for this group.</summary>
@@ -887,6 +1176,72 @@ namespace Ntc.Unity
         {
             return EnsureOnSampleData(g);
         }
+
+        void EnsureOriginalMaterials(MaterialGroup g)
+        {
+            if (g == null || (g.originalMaterials != null && g.originalMaterials.Length > 0)) return;
+            if (g.textureSet == null || string.IsNullOrEmpty(g.textureSet.originalResourcePath)) return;
+            Material original = Resources.Load<Material>(g.textureSet.originalResourcePath);
+            if (original == null) throw new InvalidOperationException("Cannot restore original material " + g.textureSet.originalResourcePath);
+            var bindings = GetOrCreateSlotBindings(g);
+            g.originalMaterials = new Material[bindings.Length];
+            for (int i = 0; i < bindings.Length; i++) g.originalMaterials[i] = original;
+            OriginalsReleased = false;
+            NtcMemoryAccounting.RememberTextures(g.originalMaterials, _originalTextureIds);
+        }
+
+        void ApplyOnSampleDirect(MaterialGroup g)
+        {
+            Material source = g.textureSet != null ? g.textureSet.texturelessTemplate : null;
+            if (source == null) throw new InvalidOperationException("Direct NTC requires a generated texture-set binding and template: " + g.name);
+            if (!string.IsNullOrEmpty(g.textureSet.directUnsupportedReason))
+            {
+                ApplyOriginal(g);
+                ReleaseNtcInputAssets(g);
+                DestroyUnityObject(g.onSampleMaterial); g.onSampleMaterial = null;
+                g.status = "direct original fallback: " + g.textureSet.directUnsupportedReason;
+                return;
+            }
+            if (!EnsureGpuData(g)) throw new InvalidOperationException("Cannot load direct NTC data: " + g.name);
+            if (directSampleShader == null) directSampleShader = Shader.Find("NTC/LitDirect_URP");
+            if (directSampleShader == null || !directSampleShader.isSupported) throw new InvalidOperationException("NTC direct Lit shader is unavailable.");
+            NtcMaterialSampling.ValidateUrpMaterial(source);
+            if (g.onSampleMaterial == null || g.onSampleMaterial.shader != directSampleShader)
+            {
+                DestroyUnityObject(g.onSampleMaterial);
+                g.onSampleMaterial = g.textureSet.directTemplate != null ? new Material(g.textureSet.directTemplate) : new Material(directSampleShader);
+                g.onSampleMaterial.name = g.name + " (NTC Direct Lit)";
+            }
+            NtcMaterialSampling.Bind(g.onSampleMaterial, source, g.assets, g.pbrLayout, g.textureSet);
+            AssignGroupMaterial(g, GetViewMaterial(g, g.onSampleMaterial));
+            g.status = "direct NTC PBR ready";
+        }
+
+        IEnumerator ReleaseOriginalsAfterDirectReady()
+        {
+            if (!releaseOriginalTextures || mode != NtcMode.InferenceOnSampleDirect || groups == null) yield break;
+            bool released = false;
+            foreach (var g in groups)
+            {
+                if (g == null || g.textureSet == null || g.onSampleMaterial == null || g.status != "direct NTC PBR ready"
+                    || string.IsNullOrEmpty(g.textureSet.originalResourcePath)) continue;
+                if (!CanRecoverOriginal(g.textureSet.originalResourcePath))
+                {
+                    g.status = "direct NTC PBR ready; originals retained (recovery unavailable)";
+                    continue;
+                }
+                g.originalMaterials = null;
+                DestroyUnityObject(g.debugViewMaterial);
+                g.debugViewMaterial = null;
+                released = true;
+            }
+            if (!released) yield break;
+            // Never destroy imported/shared textures: live consumers remain roots in Unity's graph.
+            yield return Resources.UnloadUnusedAssets();
+            OriginalsReleased = true;
+        }
+
+        static bool CanRecoverOriginal(string path) => Resources.Load<Material>(path) != null;
 
         void ApplyOnSample(MaterialGroup g)
         {
@@ -915,10 +1270,8 @@ namespace Ntc.Unity
                 g.onSampleMaterial = new Material(onSampleShader) { name = g.name + " (NTC on-Sample)" };
                 BindOnSampleMaterial(g.onSampleMaterial, g.assets);
             }
-            if (g.renderers == null) return;
             Material display = GetViewMaterial(g, g.onSampleMaterial);
-            for (int i = 0; i < g.renderers.Length; i++)
-                if (g.renderers[i] != null) g.renderers[i].sharedMaterial = display;
+            AssignGroupMaterial(g, display);
         }
 
         /// <summary>
@@ -933,8 +1286,8 @@ namespace Ntc.Unity
                 return false;
 
             string id = string.IsNullOrEmpty(g.ntcFilePath) ? g.name : g.ntcFilePath;
-            if (!_streamer.IsRegistered(id))
-                _streamer.Register(id, g.assets, g.pbrLayout, g.renderers);
+            // Register is idempotent and unions renderer consumers when groups share a cache id.
+            _streamer.Register(id, g.assets, g.pbrLayout, g.renderers);
 
             Material src = g.originalMaterials != null && g.originalMaterials.Length > 0 ? g.originalMaterials[0] : null;
             if (src == null) return false;
@@ -955,6 +1308,7 @@ namespace Ntc.Unity
         {
             if (_streamer == null || groups == null) return;
             Camera cam = Camera.main;
+            _streamer.MaxCacheBytes = (long)Mathf.Max(streamMaxCacheMB, 0) * 1024L * 1024L;
             _streamer.Tick(cam);
 
             for (int gi = 0; gi < groups.Length; gi++)
@@ -966,7 +1320,9 @@ namespace Ntc.Unity
                 NtcTileStreamer.Entry e = _streamer.Get(id);
                 if (e == null) continue;
 
-                bool resident = e.targets != null && e.residentCount > 0;
+                // Atomic presentation: an allocated/partially decoded cache is never bound.
+                // The original material stays visible until every tile and mip is ready.
+                bool resident = e.IsComplete;
                 if (resident)
                 {
                     if (e.version != g.streamBoundVersion)
@@ -974,24 +1330,28 @@ namespace Ntc.Unity
                         Material src = g.originalMaterials != null && g.originalMaterials.Length > 0 ? g.originalMaterials[0] : null;
                         BindPbrTargetsToMaterial(g.streamMaterial, src, e.targets, g.pbrLayout);
                         g.streamBoundVersion = e.version;
-                    }
-                    if (g.renderers != null)
-                    {
-                        Material display = GetViewMaterial(g, g.streamMaterial);
-                        for (int i = 0; i < g.renderers.Length; i++)
-                            if (g.renderers[i] != null && g.renderers[i].sharedMaterial != display)
-                                g.renderers[i].sharedMaterial = display;
+                        AssignGroupMaterial(g, GetViewMaterial(g, g.streamMaterial));
+                        g.status = "on-Sample ready" + PbrFallbackNote(src, g.pbrLayout);
                     }
                 }
                 else
                 {
                     // Cache was evicted (hidden too long) or not yet streamed: show original.
-                    if (g.renderers != null && g.originalMaterials != null)
-                        for (int i = 0; i < g.renderers.Length && i < g.originalMaterials.Length; i++)
-                            if (g.renderers[i] != null && (g.renderers[i].sharedMaterial == g.streamMaterial || g.renderers[i].sharedMaterial == g.debugViewMaterial))
-                                g.renderers[i].sharedMaterial = GetViewMaterial(g, g.originalMaterials[i]);
+                    if (g.streamBoundVersion >= 0)
+                    {
+                        NtcMaterialSlotBinding[] bindings = GetOrCreateSlotBindings(g);
+                        if (g.originalMaterials != null)
+                            for (int i = 0; i < bindings.Length && i < g.originalMaterials.Length; i++)
+                            {
+                                Material current = GetSlotMaterial(bindings[i]);
+                                if (current == g.streamMaterial || current == g.debugViewMaterial)
+                                    SetSlotMaterial(bindings[i], GetViewMaterial(g, g.originalMaterials[i]));
+                            }
+                    }
                     g.streamBoundVersion = -1;
+                    g.status = e.budgetBlocked ? "on-Sample deferred (VRAM budget)" : "on-Sample streaming";
                 }
+
             }
         }
 
@@ -1025,6 +1385,8 @@ namespace Ntc.Unity
                     g.pbrLayout = NtcAssetBuilder.BuildPbrLayout(g.container);
                     g.hasPbrLayout = true;
                 }
+                if (!g.hasNtcData)
+                    ReleaseNtcInputAssets(g);
                 g.status = g.hasNtcData ? "on-Sample ready" : "on-Sample build failed";
                 if (g.hasNtcData) _loadedNtcGroups++;
                 return g.hasNtcData;
@@ -1091,6 +1453,7 @@ namespace Ntc.Unity
             if (GUILayout.Button(mode == NtcMode.Original ? "▶ Original" : "  Original")) SetMode(NtcMode.Original);
             if (GUILayout.Button(mode == NtcMode.InferenceOnLoad ? "▶ on-Load" : "  on-Load")) SetMode(NtcMode.InferenceOnLoad);
             if (GUILayout.Button(mode == NtcMode.InferenceOnSample ? "▶ on-Sample" : "  on-Sample")) SetMode(NtcMode.InferenceOnSample);
+            if (GUILayout.Button(mode == NtcMode.InferenceOnSampleDirect ? "▶ Direct Lit" : "  Direct Lit")) SetMode(NtcMode.InferenceOnSampleDirect);
             GUILayout.EndHorizontal();
 
             GUILayout.BeginHorizontal();
@@ -1209,17 +1572,26 @@ namespace Ntc.Unity
                 case NtcMode.Original: return "Original textures (unchanged Unity materials, baseline)";
                 case NtcMode.InferenceOnLoad: return "on-Load: GPU compute-decompresses the whole .ntc into ordinary textures at load time (no PNG). Shaded as normal textures -> full-res VRAM, zero per-pixel MLP.";
                 case NtcMode.InferenceOnSample: return "on-Sample: tile-streamed GPU decompression into a capped-res cache, only for VISIBLE materials, budgeted per frame. Shaded as normal textures; cache evicted when hidden -> low VRAM + no per-pixel MLP.";
+                case NtcMode.InferenceOnSampleDirect: return "Direct Lit: shader material access decodes the PBR texture set. Filtering may require multiple neural texel loads; no decompressed cache.";
                 default: return m.ToString();
             }
         }
 
         void DrawStats()
         {
+            if (_displayMemory == null || Time.realtimeSinceStartup >= _nextMemorySample)
+            {
+                _displayMemory = MemorySnapshot;
+                _nextMemorySample = Time.realtimeSinceStartup + 1f;
+            }
+            GUILayout.Label("Loaded texture + NTC buffer estimate (deduplicated): " + MB(_displayMemory.estimatedTextureAndNtcBufferBytes), EditorGUIStyleLabel());
+            GUILayout.Label("  Originals " + MB(_displayMemory.originalTextureBytes) + " | Latents " + MB(_displayMemory.latentTextureBytes)
+                + " | Weights " + MB(_displayMemory.weightBufferBytes) + " | Decoded " + MB(_displayMemory.decodedCacheBytes), EditorGUIStyleLabel());
+            GUILayout.Label("  Other loaded textures " + MB(_displayMemory.otherLoadedTextureBytes) + " | Graphics driver allocation (separate): "
+                + (_displayMemory.graphicsDriverAllocationAvailable ? MB(_displayMemory.graphicsDriverAllocatedBytes) : "unavailable")
+                + " | Original references detached: " + OriginalsReleased, EditorGUIStyleLabel());
             long totalNtc = 0, totalRaw = 0, totalLatent = 0, totalWeights = 0, totalOnLoad = 0;
             int groupsBaked = 0, groupsOnLoadLoaded = 0, groupsOnSampleReady = 0;
-            long onLoadTexturesPerPixelBytes = 0; // sum of bytes-per-pixel across ALL bound on-Load textures (worst case, RGBA32, no BC)
-            long onSampleLatentBytesPerPixel = 0; // worst-case latent fetch bytes/pixel (4 layers x bilinear x RGBA32)
-            long onSampleWeightBytesTotal = 0;    // MLP weight buffer size (read once per pixel in the naive/uncached model)
 
             if (groups != null)
             {
@@ -1236,12 +1608,18 @@ namespace Ntc.Unity
                         if (File.Exists(abs)) totalNtc += new FileInfo(abs).Length;
                     }
 
-                    // on-Load side: PNGs that have actually been decoded (after entering on-Load once).
-                    if (g.ntcColor != null || g.ntcNormal != null || g.ntcMetalness != null || g.ntcAO != null)
+                    // Actual runtime allocations owned by on-Load (legacy PNG or compute targets).
+                    if (g.onLoadTargets != null)
                     {
                         groupsOnLoadLoaded++;
-                        totalOnLoad += TexVram(g.ntcColor) + TexVram(g.ntcNormal) + TexVram(g.ntcMetalness) + TexVram(g.ntcAO);
-                        if (g.ntcColor != null) onLoadTexturesPerPixelBytes = Math.Max(onLoadTexturesPerPixelBytes, 4); // RGBA32
+                        totalOnLoad += g.onLoadTargets.VramBytes;
+                    }
+                    else if (g.ntcColor != null || g.ntcNormal != null || g.ntcMetalness != null || g.ntcAO != null)
+                    {
+                        groupsOnLoadLoaded++;
+                        totalOnLoad += TexVram(g.ntcColor) + TexVram(g.ntcNormal) + TexVram(g.ntcMetalness)
+                            + TexVram(g.ntcAO) + TexVram(g.ntcSmoothness) + TexVram(g.ntcAlpha)
+                            + TexVram(g.metallicGlossMap) + TexVram(g.colorWithAlphaMap);
                     }
 
                     // on-Sample side: only groups whose GPU latent+weights are actually resident right now.
@@ -1252,27 +1630,28 @@ namespace Ntc.Unity
 
                     if (g.assets.LatentTexture != null)
                     {
-                        totalLatent += (long)g.assets.LatentTexture.width * g.assets.LatentTexture.height * g.assets.LatentTexture.depth * 4;
-                        // 4 texel bilinear fetch x 4 bytes (RGBA32) per layer, one neural mip resolved per pixel.
-                        onSampleLatentBytesPerPixel = Math.Max(onSampleLatentBytesPerPixel, (long)g.assets.LatentTexture.depth * 4 * 4);
+                        totalLatent += TexArrayVram(g.assets.LatentTexture);
                     }
                     if (g.assets.WeightBuffer != null)
                     {
                         long wBytes = (long)g.assets.WeightBuffer.count * 4;
                         totalWeights += wBytes;
-                        onSampleWeightBytesTotal = Math.Max(onSampleWeightBytesTotal, wBytes);
                     }
                 }
             }
 
-            GUILayout.Label(string.Format("  {0} baked (.ntc on disk) | {1} on-Load PNG decoded | {2} on-Sample GPU-loaded",
+            GUILayout.Label(string.Format("  {0} baked (.ntc on disk) | {1} on-Load caches allocated | {2} NTC input sets GPU-loaded",
                 groupsBaked, groupsOnLoadLoaded, groupsOnSampleReady), EditorGUIStyleLabel());
 
             bool computeReady = _decompressor != null && _decompressor.IsValid;
             long streamVram = _streamer != null ? _streamer.TotalCacheVram() : 0;
             GUI.color = computeReady ? new Color(0.7f, 1f, 0.7f) : new Color(1f, 0.7f, 0.4f);
-            GUILayout.Label(string.Format("  Compute decompress: {0}  (DP4A HW capable: {1}) | stream cache VRAM: {2}",
-                computeReady ? "ready" : "unavailable", NtcDecompressor.Dp4aHardwareSupported, MB(streamVram)), EditorGUIStyleLabel());
+            GUILayout.Label(string.Format("  Compute decompress: {0} | actual path: {1} | stream cache: {2}",
+                computeReady ? "ready" : "unavailable", NtcDecompressor.ActualComputePath, MB(streamVram)), EditorGUIStyleLabel());
+            if (_streamer != null)
+                GUILayout.Label(string.Format("  Stream budget: {0} MB | visible eligible/resident/deferred: {1}/{2}/{3}",
+                    Mathf.Max(streamMaxCacheMB, 0), _streamer.EligibleVisibleEntryCount,
+                    _streamer.ResidentVisibleEntryCount, _streamer.DeferredVisibleEntryCount), EditorGUIStyleLabel());
             GUI.color = Color.white;
 
             if (groupsBaked == 0)
@@ -1286,37 +1665,21 @@ namespace Ntc.Unity
             if (totalRaw > 0)
             {
                 double diskRatio = (double)totalRaw / Math.Max(totalNtc, 1);
-                GUILayout.Label(string.Format("Disk: raw {0} -> .ntc {1}  ({2:0.0}:1, -{3:0.0}%)",
-                    MB(totalRaw), MB(totalNtc), diskRatio,
-                    (1.0 - (double)totalNtc / totalRaw) * 100.0), EditorGUIStyleLabel());
+                GUILayout.Label(string.Format("Disk estimate: base-level channel bytes {0} | .ntc files {1} | ratio {2:0.0}:1",
+                    MB(totalRaw), MB(totalNtc), diskRatio), EditorGUIStyleLabel());
             }
 
             GUILayout.Space(2);
-            GUILayout.Label("--- Per-mode comparison (Original ≈ on-Load resolution/VRAM) ---", EditorGUIStyleLabel());
+            GUILayout.Label("--- Runtime allocation accounting (static estimate; verify with Unity Profiler) ---", EditorGUIStyleLabel());
 
-            long onSampleVram = totalLatent + totalWeights;
-            GUILayout.Label(string.Format("VRAM:  Original/on-Load {0}  |  on-Sample latent+weights {1}",
-                MB(totalOnLoad), groupsOnSampleReady > 0 ? MB(onSampleVram) : "(load on-Sample once)"), EditorGUIStyleLabel());
-            if (totalOnLoad > 0 && groupsOnSampleReady > 0)
-            {
-                double save = (1.0 - (double)onSampleVram / totalOnLoad) * 100.0;
-                GUI.color = save > 0 ? Color.green : Color.white;
-                GUILayout.Label(string.Format("       on-Sample saves {0:0.0}% VRAM vs Original/on-Load", save), EditorGUIStyleLabel());
-                GUI.color = Color.white;
-            }
+            long onSampleVram = totalLatent + totalWeights + streamVram;
+            GUILayout.Label(string.Format("  on-Load owned cache: {0} | on-Sample input+stream cache: {1}",
+                MB(totalOnLoad), groupsOnSampleReady > 0 ? MB(onSampleVram) : "(not resident)"), EditorGUIStyleLabel());
+            GUILayout.Label("  Original texture residency and allocator overhead: pending Unity Memory Profiler capture.", EditorGUIStyleLabel());
+            GUILayout.Label("  No savings percentage is reported until all three modes are measured with the same Profiler protocol.", EditorGUIStyleLabel());
 
             GUILayout.Space(2);
-            GUILayout.Label("Est. bytes touched per shaded pixel (theoretical, NOT GPU-profiled):", EditorGUIStyleLabel());
-            GUILayout.Label(string.Format("  Original/on-Load: ~{0} B (1 texel/sampled map, RGBA32 - this POC does not use real BC7/BC4)",
-                onLoadTexturesPerPixelBytes), EditorGUIStyleLabel());
-            if (groupsOnSampleReady > 0)
-            {
-                GUILayout.Label(string.Format("  on-Sample: ~{0} B latent (bilinear x4 layers) + {1} B weights (worst case, uncached)",
-                    onSampleLatentBytesPerPixel, onSampleWeightBytesTotal), EditorGUIStyleLabel());
-                GUI.color = new Color(0.7f, 0.85f, 1f);
-                GUILayout.Label("  (weight bytes are re-read from the SAME buffer by every pixel -> real HW\n   bandwidth is far lower thanks to L1/L2 cache hits. To measure real GB/s,\n   use Nsight Graphics / RenderDoc frame capture, not this estimate.)", EditorGUIStyleLabel());
-                GUI.color = Color.white;
-            }
+            GUILayout.Label("  Frame time / bandwidth: pending GPU Profiler or Nsight capture (not inferred from allocation size).", EditorGUIStyleLabel());
         }
 
         // -------------------------------------------------------------------- utils
@@ -1332,8 +1695,38 @@ namespace Ntc.Unity
 
         static string ToAbsolute(string assetsRelative)
         {
-            if (Path.IsPathRooted(assetsRelative)) return assetsRelative;
-            return Path.Combine(Application.dataPath, assetsRelative).Replace('\\', '/');
+            if (Path.IsPathRooted(assetsRelative)) return assetsRelative.Replace('\\', '/');
+
+            string relative = assetsRelative.Replace('\\', '/').TrimStart('/');
+#if UNITY_EDITOR
+            return Path.Combine(Application.dataPath, relative).Replace('\\', '/');
+#else
+            // Raw .ntc files must be shipped through StreamingAssets in a Player build.
+            // Keep the Editor-facing default (NtcPlugin/NtcData) useful by mapping it to
+            // StreamingAssets/NtcData at runtime. Explicit StreamingAssets paths and
+            // custom relative paths are supported as well.
+            const string streamingPrefix = "StreamingAssets/";
+            const string pluginPrefix = "NtcPlugin/";
+            if (relative.StartsWith(streamingPrefix, StringComparison.OrdinalIgnoreCase))
+                relative = relative.Substring(streamingPrefix.Length);
+            else if (relative.StartsWith(pluginPrefix, StringComparison.OrdinalIgnoreCase))
+                relative = relative.Substring(pluginPrefix.Length);
+            return Path.Combine(Application.streamingAssetsPath, relative).Replace('\\', '/');
+#endif
+        }
+
+        static long TexArrayVram(Texture2DArray t)
+        {
+            if (t == null) return 0;
+            long bytes = 0;
+            int w = t.width, h = t.height;
+            for (int mip = 0; mip < t.mipmapCount; mip++)
+            {
+                bytes += (long)Mathf.Max(w, 1) * Mathf.Max(h, 1) * t.depth * 4;
+                w >>= 1;
+                h >>= 1;
+            }
+            return bytes;
         }
 
         static string MakeRelative(string absPath)
@@ -1345,22 +1738,85 @@ namespace Ntc.Unity
             return absPath;
         }
 
-        static void ReleaseGroupGpuAssets(MaterialGroup g)
+        void ReleaseResourcesForMode(NtcMode destination)
+        {
+            if (destination != NtcMode.InferenceOnSample && _streamer != null)
+                _streamer.ReleaseAll();
+
+            if (groups == null) return;
+            foreach (MaterialGroup g in groups)
+            {
+                if (g == null) continue;
+                if (destination != NtcMode.InferenceOnSampleDirect && g.onSampleMaterial != null
+                    && g.onSampleMaterial.shader == directSampleShader)
+                {
+                    DestroyUnityObject(g.onSampleMaterial);
+                    g.onSampleMaterial = null;
+                }
+                if (destination != NtcMode.InferenceOnSample)
+                {
+                    g.streamActive = false;
+                    g.streamBoundVersion = -1;
+                    DestroyUnityObject(g.streamMaterial);
+                    g.streamMaterial = null;
+                }
+                if (destination != NtcMode.InferenceOnLoad)
+                    ReleaseOnLoadCache(g);
+
+                // Original owns no NTC runtime allocation. On-Load and on-Sample may reuse
+                // latent/weight inputs while switching directly between those two modes.
+                if (destination == NtcMode.Original)
+                {
+                    ReleaseNtcInputAssets(g);
+                    DestroyUnityObject(g.onSampleMaterial);
+                    g.onSampleMaterial = null;
+                }
+            }
+        }
+
+        static void ReleaseOwnedTexture(ref Texture2D texture, ref bool owned)
+        {
+            if (owned) DestroyUnityObject(texture);
+            if (owned) texture = null;
+            owned = false;
+        }
+
+        static void ReleaseOnLoadCache(MaterialGroup g)
         {
             if (g == null) return;
-            if (g.assets != null && g.assets.WeightBuffer != null)
-            {
-                g.assets.WeightBuffer.Release();
-                g.assets.WeightBuffer = null;
-            }
             if (g.onLoadTargets != null)
             {
                 g.onLoadTargets.Release();
                 g.onLoadTargets = null;
             }
+            ReleaseOwnedTexture(ref g.ntcColor, ref g.ownsNtcColor);
+            ReleaseOwnedTexture(ref g.ntcNormal, ref g.ownsNtcNormal);
+            ReleaseOwnedTexture(ref g.ntcMetalness, ref g.ownsNtcMetalness);
+            ReleaseOwnedTexture(ref g.ntcAO, ref g.ownsNtcAO);
+            ReleaseOwnedTexture(ref g.ntcSmoothness, ref g.ownsNtcSmoothness);
+            ReleaseOwnedTexture(ref g.ntcAlpha, ref g.ownsNtcAlpha);
+            DestroyUnityObject(g.colorWithAlphaMap);
+            DestroyUnityObject(g.metallicGlossMap);
+            DestroyUnityObject(g.onLoadMaterial);
+            g.colorWithAlphaMap = null;
+            g.metallicGlossMap = null;
+            g.onLoadMaterial = null;
+        }
+
+        static void ReleaseNtcInputAssets(MaterialGroup g)
+        {
+            if (g == null) return;
+            if (g.assets != null) g.assets.Release();
             g.assets = null;
             g.container = null;
             g.hasNtcData = false;
+        }
+
+        static void ReleaseGroupGpuAssets(MaterialGroup g)
+        {
+            if (g == null) return;
+            ReleaseNtcInputAssets(g);
+            ReleaseOnLoadCache(g);
             g.hasPbrLayout = false;
         }
 
@@ -1373,10 +1829,35 @@ namespace Ntc.Unity
 
         void OnDisable()
         {
+            // A GameObject deactivation stops coroutines, while disabling only this
+            // component does not. Cancel explicitly in both cases so re-enable can
+            // restart an interrupted scan instead of retaining a stuck initializing flag.
+            if (_initializeRoutine != null)
+            {
+                StopCoroutine(_initializeRoutine);
+                _initializeRoutine = null;
+            }
+            if (_initializing)
+            {
+                _initializing = false;
+                // Initialization can already own the compute decompressor's dummy UAVs.
+                // No material modes have been applied yet, so these are its only GPU owners.
+                if (_streamer != null) _streamer.ReleaseAll();
+                _streamer = null;
+                if (_decompressor != null) _decompressor.Dispose();
+                _decompressor = null;
+            }
             if (!_initialized || groups == null) return;
+            if (_applyRoutine != null)
+            {
+                StopCoroutine(_applyRoutine);
+                _applyRoutine = null;
+            }
+            _applyingMode = false;
             foreach (var g in groups)
                 if (g != null)
                     RestoreOriginalMaterialRefs(g);
+            ReleaseResourcesForMode(NtcMode.Original);
         }
 
         void OnDestroy()
@@ -1400,12 +1881,15 @@ namespace Ntc.Unity
                 DestroyUnityObject(g.onSampleMaterial);
                 DestroyUnityObject(g.streamMaterial);
                 DestroyUnityObject(g.debugViewMaterial);
+                DestroyUnityObject(g.colorWithAlphaMap);
                 DestroyUnityObject(g.metallicGlossMap);
                 g.onLoadMaterial = null;
                 g.onSampleMaterial = null;
                 g.streamMaterial = null;
                 g.debugViewMaterial = null;
+                g.colorWithAlphaMap = null;
                 g.metallicGlossMap = null;
+                NtcMaterialSlotRegistry.Remove(g);
             }
         }
     }

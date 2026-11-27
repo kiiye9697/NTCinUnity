@@ -1,0 +1,21 @@
+{
+  "name": "com.kiiye.ntc-unity",
+  "version": "0.2.0",
+  "displayName": "NTC Unity",
+  "description": "Unity runtime, editor tooling, shaders, and validation tests for NVIDIA NTC texture containers.",
+  "unity": "2021.3",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "dependencies": {
+    "com.unity.modules.imageconversion": "1.0.0"
+  },
+  "keywords": [
+    "ntc",
+    "neural-texture-compression",
+    "rendering",
+    "urp"
+  ],
+  "author": {
+    "name": "Kiiye"
+  },
+  "samples": []
+}

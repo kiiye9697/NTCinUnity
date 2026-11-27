@@ -22,8 +22,7 @@ namespace Ntc.Unity
             var ctrl = (NtcSceneController)target;
 
             EditorGUILayout.HelpBox(
-                "This component switches ALL renderers in the open scene between 3 modes at " +
-                "runtime (Original / on-Load / on-Sample) and shows a debug panel while playing.\n\n" +
+                "Runtime modes: Original / on-Load / streamed on-Sample / direct PBR on-Sample.\n\n" +
                 "Fields you actually need to touch: Mode (default mode on Play), On Sample Shader " +
                 "(usually auto-found), Ntc Data Path (only if you moved the Bake output folder), " +
                 "and the UI toggle key.\n\n" +
@@ -36,6 +35,10 @@ namespace Ntc.Unity
 
             EditorGUILayout.PropertyField(serializedObject.FindProperty("mode"));
             EditorGUILayout.PropertyField(serializedObject.FindProperty("onSampleShader"));
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("directSampleShader"));
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("textureSets"), true);
+            EditorGUILayout.PropertyField(serializedObject.FindProperty("releaseOriginalTextures"));
+            if (ctrl.releaseOriginalTextures) EditorGUILayout.HelpBox("Managed originals require prepared bindings and recoverable Resources materials. Shared textures remain resident while another consumer uses them.", MessageType.Info);
             EditorGUILayout.PropertyField(serializedObject.FindProperty("onLoadSwapAllMaps"));
             EditorGUILayout.PropertyField(serializedObject.FindProperty("ntcDataPath"));
             EditorGUILayout.PropertyField(serializedObject.FindProperty("ntcFilePrefix"));
@@ -83,7 +86,7 @@ namespace Ntc.Unity
                 NtcSceneController.MaterialGroup g = groups[i];
                 if (g == null) continue;
                 int rendererCount = g.renderers != null ? g.renderers.Length : 0;
-                string ntcInfo = string.IsNullOrEmpty(g.ntcFilePath) ? "not baked yet" : g.ntcFilePath;
+                string ntcInfo = g.textureSet != null ? AssetDatabase.GetAssetPath(g.textureSet) : string.IsNullOrEmpty(g.ntcFilePath) ? "not baked yet" : g.ntcFilePath;
 
                 EditorGUILayout.BeginHorizontal("box");
                 EditorGUILayout.LabelField(g.name, GUILayout.Width(160));

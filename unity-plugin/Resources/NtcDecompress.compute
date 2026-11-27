@@ -207,9 +207,9 @@ void NtcPrepareInputs(int2 texel, float2 uv, int neuralMip, float positionLod, f
 
 // Load one layer's weights/scale/bias into groupshared, then evaluate.
 // IN/OUT are compile-time literals so the inner loop unrolls.
-#define NTC_DEFINE_LAYER(FuncName, IN, OUT, OUTPUT_LAYER)                                       \
+#define NTC_DEFINE_LAYER(FuncName, IN, OUT, OUTPUT_LAYER, OUT_ARRAY_SIZE)                       \
 void FuncName(int weightOffset, int biasOffset, int scaleOffset, int linearThreadIndex,        \
-              uint inputArray[IN / 4], out uint outputArray[OUTPUT_LAYER ? OUT : OUT / 4])      \
+              uint inputArray[IN / 4], out uint outputArray[OUT_ARRAY_SIZE])                    \
 {                                                                                              \
     GroupMemoryBarrierWithGroupSync();                                                         \
     if (linearThreadIndex < (OUT) / 4)                                                         \
@@ -256,10 +256,11 @@ void FuncName(int weightOffset, int biasOffset, int scaleOffset, int linearThrea
     }                                                                                          \
 }
 
-NTC_DEFINE_LAYER(NtcLayer0, NTC_MLP_INPUT_CHANNELS,   NTC_MLP_HIDDEN0_CHANNELS, false)
-NTC_DEFINE_LAYER(NtcLayer1, NTC_MLP_HIDDEN0_CHANNELS, NTC_MLP_HIDDEN1_CHANNELS, false)
-NTC_DEFINE_LAYER(NtcLayer2, NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_HIDDEN2_CHANNELS, false)
-NTC_DEFINE_LAYER(NtcLayer3, NTC_MLP_HIDDEN2_CHANNELS, NTC_MLP_OUTPUT_CHANNELS,  true)
+// FXC rejects a bool ternary expression as an array bound, even with literal operands.
+NTC_DEFINE_LAYER(NtcLayer0, NTC_MLP_INPUT_CHANNELS,   NTC_MLP_HIDDEN0_CHANNELS, false, 16)
+NTC_DEFINE_LAYER(NtcLayer1, NTC_MLP_HIDDEN0_CHANNELS, NTC_MLP_HIDDEN1_CHANNELS, false, 12)
+NTC_DEFINE_LAYER(NtcLayer2, NTC_MLP_HIDDEN1_CHANNELS, NTC_MLP_HIDDEN2_CHANNELS, false, 8)
+NTC_DEFINE_LAYER(NtcLayer3, NTC_MLP_HIDDEN2_CHANNELS, NTC_MLP_OUTPUT_CHANNELS,  true, 16)
 
 float ChannelValue(uint outputs[NTC_MLP_OUTPUT_CHANNELS], int ch)
 {

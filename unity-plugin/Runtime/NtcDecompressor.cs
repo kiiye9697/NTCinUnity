@@ -43,7 +43,10 @@ namespace Ntc.Unity
         static long RtBytes(RenderTexture rt)
         {
             if (rt == null) return 0;
-            long baseB = (long)rt.width * rt.height * 4;
+            // Mask is normally R16G16B16A16 (8 B/texel), while the other targets are
+            // RGBA8 (4 B/texel). The old fixed 4-byte estimate underreported Mask by 2x.
+            int bytesPerPixel = rt.graphicsFormat == GraphicsFormat.R16G16B16A16_UNorm ? 8 : 4;
+            long baseB = (long)rt.width * rt.height * bytesPerPixel;
             return rt.useMipMap ? (long)(baseB * 1.3333) : baseB;
         }
 
@@ -59,7 +62,8 @@ namespace Ntc.Unity
         {
             if (rt == null) return;
             rt.Release();
-            UnityEngine.Object.Destroy(rt);
+            if (Application.isPlaying) UnityEngine.Object.Destroy(rt);
+            else UnityEngine.Object.DestroyImmediate(rt);
             rt = null;
         }
     }
@@ -85,17 +89,18 @@ namespace Ntc.Unity
         readonly int _kernel;
         RenderTexture[] _dummies; // one per output slot (Unity requires every UAV be bound)
 
-        public bool IsValid { get { return _cs != null && _kernel >= 0; } }
-        public static bool Dp4aHardwareSupported
+        public bool IsValid { get { return _cs != null && _kernel >= 0 && _cs.IsSupported(_kernel); } }
+        public static string ActualComputePath
         {
             get
             {
 #if UNITY_2020_1_OR_NEWER
-                return SystemInfo.supportsComputeShaders &&
-                       (SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.Direct3D12 ||
-                        SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.Vulkan);
+                if (!SystemInfo.supportsComputeShaders) return "unavailable (no compute shaders)";
+                // Graphics API alone cannot tell us which compiled shader variant Unity selected.
+                // Do not report hardware DP4A without inspecting the actual compiled instructions.
+                return "INT8 compute (" + SystemInfo.graphicsDeviceType + "; instruction path unverified)";
 #else
-                return false;
+                return "software int8 dot shader";
 #endif
             }
         }
@@ -103,15 +108,22 @@ namespace Ntc.Unity
         public NtcDecompressor(ComputeShader cs)
         {
             _cs = cs;
-            _kernel = (cs != null) ? cs.FindKernel("NtcDecompressMain") : -1;
-            if (_cs != null && _kernel >= 0)
+            _kernel = (cs != null && SystemInfo.graphicsDeviceType != UnityEngine.Rendering.GraphicsDeviceType.Null
+                && SystemInfo.supportsComputeShaders && cs.HasKernel("NtcDecompressMain")) ? cs.FindKernel("NtcDecompressMain") : -1;
+            if (IsValid)
             {
                 _dummies = new RenderTexture[4];
-                for (int i = 0; i < 4; i++)
+                try
                 {
-                    var d = new RenderTexture(1, 1, 0, GraphicsFormat.R8G8B8A8_UNorm) { enableRandomWrite = true };
-                    d.Create();
-                    _dummies[i] = d;
+                    for (int i = 0; i < 4; i++)
+                    {
+                        _dummies[i] = CreateTarget(1, 1, false);
+                    }
+                }
+                catch
+                {
+                    Dispose();
+                    throw;
                 }
             }
         }
@@ -130,16 +142,30 @@ namespace Ntc.Unity
 
         public static RenderTexture CreateTarget(int w, int h, bool mips, GraphicsFormat format = GraphicsFormat.R8G8B8A8_UNorm)
         {
-            var rt = new RenderTexture(w, h, 0, format)
+            RenderTexture rt = null;
+            try
             {
-                enableRandomWrite = true,
-                useMipMap = mips,
-                autoGenerateMips = false,
-                wrapMode = TextureWrapMode.Repeat,
-                filterMode = FilterMode.Bilinear,
-            };
-            rt.Create();
-            return rt;
+                rt = new RenderTexture(w, h, 0, format)
+                {
+                    enableRandomWrite = true,
+                    useMipMap = mips,
+                    autoGenerateMips = false,
+                    wrapMode = TextureWrapMode.Repeat,
+                    filterMode = FilterMode.Bilinear,
+                };
+                if (!rt.Create()) throw new InvalidOperationException("Failed to create NTC render target " + w + "x" + h + " (" + format + ").");
+                return rt;
+            }
+            catch
+            {
+                if (rt != null)
+                {
+                    rt.Release();
+                    if (Application.isPlaying) UnityEngine.Object.Destroy(rt);
+                    else UnityEngine.Object.DestroyImmediate(rt);
+                }
+                throw;
+            }
         }
 
         // Mask (metallic/smoothness) gets 16 bits per channel instead of the 8 bits used for
@@ -158,12 +184,20 @@ namespace Ntc.Unity
         public NtcDecompressTargets AllocateTargets(int width, int height, NtcPbrChannelLayout layout, bool mips)
         {
             var t = new NtcDecompressTargets { Width = width, Height = height };
-            if (layout.HasColor)  t.BaseColor = CreateTarget(width, height, mips);
-            if (layout.HasNormal) t.Normal    = CreateTarget(width, height, mips);
-            if (layout.HasMask)   t.Mask      = CreateTarget(width, height, mips,
-                SystemInfo.IsFormatSupported(kMaskFormat, FormatUsage.LoadStore) ? kMaskFormat : GraphicsFormat.R8G8B8A8_UNorm);
-            if (layout.HasAO)     t.AO        = CreateTarget(width, height, mips);
-            return t;
+            try
+            {
+                if (layout.HasColor)  t.BaseColor = CreateTarget(width, height, mips);
+                if (layout.HasNormal) t.Normal    = CreateTarget(width, height, mips);
+                if (layout.HasMask)   t.Mask      = CreateTarget(width, height, mips,
+                    SystemInfo.IsFormatSupported(kMaskFormat, FormatUsage.LoadStore) ? kMaskFormat : GraphicsFormat.R8G8B8A8_UNorm);
+                if (layout.HasAO)     t.AO        = CreateTarget(width, height, mips);
+                return t;
+            }
+            catch
+            {
+                t.Release();
+                throw;
+            }
         }
 
         /// <summary>Decompress the whole image at one color mip into freshly matching-size targets.</summary>
@@ -186,7 +220,7 @@ namespace Ntc.Unity
                                      RectInt srcRect, Vector2Int dstTopLeft)
         {
             if (!IsValid || assets == null || assets.LatentTexture == null || assets.WeightBuffer == null)
-                return;
+                throw new InvalidOperationException("NTC inference kernel or GPU inputs are unavailable.");
 
             int mipW = Mathf.Max(assets.Constants.imageWidth >> colorMip, 1);
             int mipH = Mathf.Max(assets.Constants.imageHeight >> colorMip, 1);
@@ -200,7 +234,7 @@ namespace Ntc.Unity
             _cs.SetInts("_SrcRect", srcRect.xMin, srcRect.yMin, srcRect.xMax, srcRect.yMax);
             _cs.SetInts("_DstOffset", dstTopLeft.x - srcRect.xMin, dstTopLeft.y - srcRect.yMin, 0, 0);
 
-            bool colorIsSrgb = layout.ColorIsSrgb;
+            bool colorIsSrgb = layout.ColorIsSrgb && QualitySettings.activeColorSpace == ColorSpace.Linear;
             if (DebugColorSpaceMode == ColorSpaceMode.ForceSrgbDecode) colorIsSrgb = true;
             else if (DebugColorSpaceMode == ColorSpaceMode.ForceRawLinear) colorIsSrgb = false;
             _cs.SetInts("_ColorChannels", layout.ColorR, layout.ColorG, layout.ColorB, colorIsSrgb ? 1 : 0);
@@ -245,7 +279,8 @@ namespace Ntc.Unity
                 {
                     if (_dummies[i] == null) continue;
                     _dummies[i].Release();
-                    UnityEngine.Object.Destroy(_dummies[i]);
+                    if (Application.isPlaying) UnityEngine.Object.Destroy(_dummies[i]);
+                    else UnityEngine.Object.DestroyImmediate(_dummies[i]);
                     _dummies[i] = null;
                 }
                 _dummies = null;

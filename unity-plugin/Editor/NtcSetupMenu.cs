@@ -23,6 +23,8 @@ namespace Ntc.UnityEditorTools
 
             if (ctrl.onSampleShader == null)
                 ctrl.onSampleShader = Shader.Find("NTC/InferenceOnSample_URP");
+            if (ctrl.directSampleShader == null) ctrl.directSampleShader = Shader.Find("NTC/LitDirect_URP");
+            if (ctrl.pbrDebugShader == null) ctrl.pbrDebugShader = Shader.Find("NTC/PBRChannelDebug_URP");
 
             // Scan the scene RIGHT NOW, in Edit mode, and write the result into the component so it
             // actually persists. Scanning only inside Play mode (as the runtime coroutine also does)

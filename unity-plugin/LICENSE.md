@@ -1,0 +1,63 @@
+NTCinUnity Research and Evaluation License
+=========================================
+
+Copyright (c) 2026 kiiye9697
+
+This license applies to the original NTCinUnity material in this repository. It
+does not replace or modify the licenses of third-party components, including the
+NVIDIA RTXNTC submodule and NVIDIA-derived shader portions identified in
+THIRD-PARTY-NOTICES.md.
+
+1. Permission
+-------------
+
+You may download, build, run, study, and modify the original NTCinUnity material
+for non-commercial research, education, benchmarking, and technical evaluation.
+
+2. Restrictions
+---------------
+
+Unless you have prior written permission from the copyright holder, you may not:
+
+  a. use the original NTCinUnity material in a commercial product or service;
+  b. redistribute the original NTCinUnity material, or a derivative of it, in
+     source or binary form;
+  c. sublicense or relicense it;
+  d. remove copyright, attribution, or license notices.
+
+3. NVIDIA RTXNTC
+----------------
+
+The directory `nvidia-backend/` is a Git submodule that points to NVIDIA's
+official RTXNTC repository. It is a separate work governed by the license in that
+repository. This license does not apply to it.
+
+Parts of these files are derived from NVIDIA RTXNTC shader code:
+
+  unity-plugin/Shaders/NtcInference.hlsl
+  unity-plugin/Resources/NtcDecompress.compute
+
+The NVIDIA-derived portions are governed by NVIDIA's terms, not by this license.
+The files carry attribution headers, and THIRD-PARTY-NOTICES.md records their
+origin.
+
+4. Unity
+--------
+
+Unity and the Universal Render Pipeline remain subject to the Unity Software
+Terms. No Unity engine or URP source is licensed by this repository.
+
+5. No warranty
+--------------
+
+THE MATERIAL IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING
+FROM, OUT OF, OR IN CONNECTION WITH THE MATERIAL OR ITS USE.
+
+6. Contact
+----------
+
+For commercial use or redistribution permission, open an issue at:
+https://github.com/kiiye9697/NTCinUnity

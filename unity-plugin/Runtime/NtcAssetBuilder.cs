@@ -6,6 +6,7 @@
 using System;
 using System.IO;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 using Ntc.Packing;
 
 namespace Ntc.Unity
@@ -19,6 +20,22 @@ namespace Ntc.Unity
         public ComputeBuffer WeightBuffer;
         public NtcTextureSetConstants Constants;
         public string Report;
+
+        /// <summary>Release every Unity GPU object owned by this build result.</summary>
+        public void Release()
+        {
+            if (WeightBuffer != null)
+            {
+                WeightBuffer.Release();
+                WeightBuffer = null;
+            }
+            if (LatentTexture != null)
+            {
+                if (Application.isPlaying) UnityEngine.Object.Destroy(LatentTexture);
+                else UnityEngine.Object.DestroyImmediate(LatentTexture);
+                LatentTexture = null;
+            }
+        }
     }
 
     /// <summary>
@@ -76,6 +93,7 @@ namespace Ntc.Unity
 
     public static class NtcAssetBuilder
     {
+        public static bool PreferPackedLatents = true;
         // NTC network constants (from InferenceConstants.h, compile-time fixed)
         public const int NTC_MLP_FEATURES = 16;
         public const int NTC_FEATURES_PER_LAYER = 4;
@@ -88,16 +106,11 @@ namespace Ntc.Unity
         /// </summary>
         public static NtcBuiltAssets Build(NtcContainer container, int mlpVersion = 0)
         {
+            ValidateInferenceModel(container, mlpVersion);
             NtcBuiltAssets result = new NtcBuiltAssets();
             try
             {
                 NtcTextureSetDocument doc = container.Document;
-
-                if (mlpVersion >= doc.MlpVersions.Count)
-                {
-                    Debug.LogError("[NTC] MLP version " + mlpVersion + " out of range (have " + doc.MlpVersions.Count + ")");
-                    return result;
-                }
 
                 NtcMlp mlp = doc.MlpVersions[mlpVersion];
 
@@ -124,8 +137,8 @@ namespace Ntc.Unity
                             layer.WeightView, layer.ScaleView, layer.BiasView);
                     }
                     if (result.LatentTexture != null)
-                        sw.WriteLine("Latent texture: {0}x{1}, {2} layers (RGBA32 expanded from BGRA4)",
-                            result.LatentTexture.width, result.LatentTexture.height, result.LatentTexture.depth);
+                        sw.WriteLine("Latent texture: {0}x{1}, {2} layers ({3})",
+                            result.LatentTexture.width, result.LatentTexture.height, result.LatentTexture.depth, result.LatentTexture.graphicsFormat);
                     if (result.WeightBuffer != null)
                         sw.WriteLine("Weight buffer: {0} bytes ({1} uints)", result.WeightBuffer.count * 4, result.WeightBuffer.count);
                     sw.WriteLine("Network weight offsets: ({0}, {1}, {2}, {3})",
@@ -138,13 +151,81 @@ namespace Ntc.Unity
             }
             catch
             {
-                if (result.WeightBuffer != null)
-                {
-                    result.WeightBuffer.Release();
-                    result.WeightBuffer = null;
-                }
+                // BuildWeightBuffer succeeds before BuildLatentTexture. If any later upload,
+                // constants, or report step fails, neither object may remain resident.
+                result.Release();
                 throw;
             }
+        }
+
+        /// <summary>Validate the fixed shader contract before allocating any GPU resources.</summary>
+        public static void ValidateInferenceModel(NtcContainer container, int mlpVersion = 0)
+        {
+            if (container == null || container.Document == null || container.DataChunk == null)
+                throw new InvalidDataException("NTC container has no document or data chunk.");
+            NtcTextureSetDocument doc = container.Document;
+            if (mlpVersion < 0 || mlpVersion >= doc.MlpVersions.Count)
+                throw new NotSupportedException("NTC MLP version is unavailable: " + mlpVersion);
+            NtcMlp mlp = doc.MlpVersions[mlpVersion];
+            if (mlp.Activation != "HGELUClamp" || mlp.WeightLayout != "RowMajor" || mlp.Layers.Count != 4)
+                throw new NotSupportedException("NTC shaders require a four-layer RowMajor HGELUClamp INT8 model.");
+            int[] channels = { 48, 64, 48, 32, 16 };
+            for (int i = 0; i < 4; i++)
+            {
+                NtcMlpLayer layer = mlp.Layers[i];
+                if (layer.InputChannels != channels[i] || layer.OutputChannels != channels[i + 1]
+                    || layer.WeightType != "Int8" || layer.ScaleType != "Float32" || layer.BiasType != "Int32")
+                    throw new NotSupportedException("NTC layer " + i + " does not match the 48/64/48/32/16 INT8 shader contract.");
+                ValidateView(container, layer.WeightView, (long)channels[i] * channels[i + 1]);
+                ValidateView(container, layer.ScaleView, channels[i + 1] * 4L);
+                ValidateView(container, layer.BiasView, channels[i + 1] * 4L);
+            }
+            if (doc.Width <= 0 || doc.Height <= 0 || doc.NumChannels < 1 || doc.NumChannels > 16
+                || doc.NumColorMips < 1 || doc.NumColorMips > 16 || doc.ColorMips.Count != doc.NumColorMips
+                || doc.Latents.Count < 1 || doc.Latents.Count > NTC_MAX_NEURAL_MIPS)
+                throw new InvalidDataException("NTC image dimensions, channels or mip count are invalid.");
+            int layers = doc.Latents[0].LayerViews.Count;
+            if (layers < 1 || layers > 4)
+                throw new NotSupportedException("NTC latent grid must have one to four feature layers.");
+            for (int i = 0; i < doc.Latents.Count; i++)
+            {
+                NtcLatentImage latent = doc.Latents[i];
+                if (latent.Width != Math.Max(doc.Latents[0].Width >> i, 1)
+                    || latent.Height != Math.Max(doc.Latents[0].Height >> i, 1)
+                    || latent.Width <= 0 || latent.Height <= 0 || latent.LayerViews.Count != layers)
+                    throw new NotSupportedException("NTC latent mips must form a complete, consistently layered texture mip chain.");
+                foreach (int view in latent.LayerViews)
+                    ValidateView(container, view, (long)latent.Width * latent.Height * 2);
+            }
+            for (int i = 0; i < doc.NumColorMips; i++)
+            {
+                NtcColorMip mip = doc.ColorMips[i];
+                bool missingSecondGrid = mip.LatentMip + 1 >= doc.Latents.Count
+                    && (doc.Latents[doc.Latents.Count - 1].Width > 1 || doc.Latents[doc.Latents.Count - 1].Height > 1);
+                double quantizedLod = Math.Truncate((double)mip.PositionLod * 127.5);
+                if (mip.LatentMip < 0 || mip.LatentMip >= doc.Latents.Count || missingSecondGrid
+                    || mip.Width != Math.Max(doc.Width >> i, 1) || mip.Height != Math.Max(doc.Height >> i, 1)
+                    || float.IsNaN(mip.PositionLod) || float.IsInfinity(mip.PositionLod)
+                    || quantizedLod < -128 || quantizedLod > 127
+                    || float.IsNaN(mip.PositionScale) || float.IsInfinity(mip.PositionScale))
+                    throw new InvalidDataException("NTC color mip " + i + " has invalid dimensions or neural grid metadata.");
+            }
+            foreach (NtcTexture texture in doc.Textures)
+                if (texture.FirstChannel < 0 || texture.NumChannels < 1
+                    || texture.FirstChannel > doc.NumChannels - texture.NumChannels)
+                    throw new InvalidDataException("NTC texture channel range is outside the model output.");
+        }
+
+        static void ValidateView(NtcContainer container, int index, long expectedBytes)
+        {
+            if (index < 0 || index >= container.Document.Views.Count)
+                throw new InvalidDataException("NTC inference references missing buffer view " + index);
+            NtcBufferView view = container.Document.Views[index];
+            if (view.IsCompressed)
+                throw new NotSupportedException("NTC inference requires uncompressed views; rebake with --gdeflate off.");
+            if (view.StoredSize != expectedBytes || view.Offset < 0 || view.StoredSize > container.DataChunk.LongLength
+                || view.Offset > container.DataChunk.LongLength - view.StoredSize)
+                throw new InvalidDataException("NTC inference buffer view " + index + " has an invalid size or range.");
         }
 
         private static ComputeBuffer BuildWeightBuffer(NtcContainer container, NtcMlp mlp)
@@ -170,9 +251,18 @@ namespace Ntc.Unity
                 uint[] uintData = new uint[uintCount];
                 Buffer.BlockCopy(allBytes, 0, uintData, 0, allBytes.Length);
 
-                ComputeBuffer cb = new ComputeBuffer(uintCount, sizeof(uint), ComputeBufferType.Raw);
-                cb.SetData(uintData);
-                return cb;
+                ComputeBuffer cb = null;
+                try
+                {
+                    cb = new ComputeBuffer(uintCount, sizeof(uint), ComputeBufferType.Raw);
+                    cb.SetData(uintData);
+                    return cb;
+                }
+                catch
+                {
+                    if (cb != null) cb.Release();
+                    throw;
+                }
             }
         }
 
@@ -197,43 +287,73 @@ namespace Ntc.Unity
             // NTC latent format is BGRA4 (4 bits per channel, 16 bits per texel).
             // Unity doesn't have a native BGRA4 format, so we use linear RGBA32 and
             // expand each 4-bit value to 8-bit (shader scales it back to INT8 inputs).
-            Texture2DArray texArray = new Texture2DArray(width, height, numLayers,
-                TextureFormat.RGBA32, mipCount > 1, true);
-            texArray.wrapMode = TextureWrapMode.Repeat;
-            texArray.filterMode = FilterMode.Bilinear;
-
-            for (int mip = 0; mip < mipCount; mip++)
+            Texture2DArray texArray = null;
+            try
             {
-                NtcLatentImage latent = doc.Latents[mip];
-                int mipLayers = Math.Min(numLayers, latent.LayerViews.Count);
-                int texelCount = latent.Width * latent.Height;
+                var packedFormat = GraphicsFormat.B4G4R4A4_UNormPack16;
+                bool packed = PreferPackedLatents && SystemInfo.IsFormatSupported(packedFormat, FormatUsage.Sample)
+                    && SystemInfo.IsFormatSupported(packedFormat, FormatUsage.Linear);
+                texArray = packed
+                    ? new Texture2DArray(width,height,numLayers,packedFormat,mipCount > 1 ? TextureCreationFlags.MipChain : TextureCreationFlags.None)
+                    : new Texture2DArray(width, height, numLayers, TextureFormat.RGBA32, mipCount > 1, true);
+                texArray.wrapMode = TextureWrapMode.Repeat;
+                texArray.filterMode = FilterMode.Bilinear;
 
-                for (int layer = 0; layer < mipLayers; layer++)
+                for (int mip = 0; mip < mipCount; mip++)
                 {
-                    int viewIndex = latent.LayerViews[layer];
-                    byte[] rawBytes = container.GetViewBytes(viewIndex);
-                    byte[] rgba32 = new byte[texelCount * 4];
+                    NtcLatentImage latent = doc.Latents[mip];
+                    int mipLayers = Math.Min(numLayers, latent.LayerViews.Count);
+                    int texelCount = latent.Width * latent.Height;
 
-                    for (int i = 0; i < texelCount && i * 2 + 1 < rawBytes.Length; i++)
+                    for (int layer = 0; layer < mipLayers; layer++)
                     {
-                        byte b0 = rawBytes[i * 2];
-                        byte b1 = rawBytes[i * 2 + 1];
-                        int r4 = b0 & 0x0F;
-                        int g4 = (b0 >> 4) & 0x0F;
-                        int b4 = b1 & 0x0F;
-                        int a4 = (b1 >> 4) & 0x0F;
-                        rgba32[i * 4 + 0] = (byte)(r4 | (r4 << 4));
-                        rgba32[i * 4 + 1] = (byte)(g4 | (g4 << 4));
-                        rgba32[i * 4 + 2] = (byte)(b4 | (b4 << 4));
-                        rgba32[i * 4 + 3] = (byte)(a4 | (a4 << 4));
+                        int viewIndex = latent.LayerViews[layer];
+                        byte[] rawBytes = container.GetViewBytes(viewIndex);
+                        if (packed)
+                        {
+                            // BGRA4 hardware reads R from nibble 2. Swap R/B in the upload,
+                            // so every shader sees the same physical feature order as RGBA32.
+                            byte[] bgra = new byte[texelCount * 2];
+                            for (int i = 0; i < texelCount; i++)
+                            {
+                                byte lo = rawBytes[i*2], hi = rawBytes[i*2+1];
+                                bgra[i*2] = (byte)((lo & 0xf0) | (hi & 0x0f));
+                                bgra[i*2+1] = (byte)((hi & 0xf0) | (lo & 0x0f));
+                            }
+                            texArray.SetPixelData(bgra,mip,layer);
+                            continue;
+                        }
+                        byte[] rgba32 = new byte[texelCount * 4];
+
+                        for (int i = 0; i < texelCount && i * 2 + 1 < rawBytes.Length; i++)
+                        {
+                            byte b0 = rawBytes[i * 2];
+                            byte b1 = rawBytes[i * 2 + 1];
+                            int r4 = b0 & 0x0F;
+                            int g4 = (b0 >> 4) & 0x0F;
+                            int b4 = b1 & 0x0F;
+                            int a4 = (b1 >> 4) & 0x0F;
+                            rgba32[i * 4 + 0] = (byte)(r4 | (r4 << 4));
+                            rgba32[i * 4 + 1] = (byte)(g4 | (g4 << 4));
+                            rgba32[i * 4 + 2] = (byte)(b4 | (b4 << 4));
+                            rgba32[i * 4 + 3] = (byte)(a4 | (a4 << 4));
+                        }
+
+                        texArray.SetPixelData(rgba32, mip, layer);
                     }
-
-                    texArray.SetPixelData(rgba32, mip, layer);
                 }
+                texArray.Apply(false, true);
+                return texArray;
             }
-            texArray.Apply(false, true);
-
-            return texArray;
+            catch
+            {
+                if (texArray != null)
+                {
+                    if (Application.isPlaying) UnityEngine.Object.Destroy(texArray);
+                    else UnityEngine.Object.DestroyImmediate(texArray);
+                }
+                throw;
+            }
         }
 
         private static NtcTextureSetConstants BuildConstants(NtcContainer container, NtcMlp mlp)
@@ -357,13 +477,6 @@ namespace Ntc.Unity
                     layout.ColorB = t.NumChannels > 2 ? c0 + 2 : c0;
                     layout.ColorIsSrgb = srgb;
                 }
-            }
-
-            // Fallback: if no texture was named "color", assume the first 3 channels are color.
-            if (layout.ColorR < 0 && doc.NumChannels >= 3)
-            {
-                layout.ColorR = 0; layout.ColorG = 1; layout.ColorB = 2;
-                layout.ColorIsSrgb = true;
             }
 
             return layout;
