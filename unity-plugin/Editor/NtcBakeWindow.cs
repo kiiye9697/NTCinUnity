@@ -754,7 +754,29 @@ namespace Ntc.UnityEditorTools
                         UpdateMaterialProgress(index, total, local, entry.materialName + ": training " + step + "/" + entry.trainingSteps + "...");
                     }
                 });
-                NtcAssetBuilder.ValidateInferenceModel(NtcContainerReader.Load(ntcOutput));
+                NtcAssetBuilder.ValidateInferenceModel(NtcContainerReader.LoadMetadata(ntcOutput));
+                string recordDir = Path.Combine(outputDir, "Training", entry.stableId,
+                    DateTime.UtcNow.ToString("yyyyMMddTHHmmssfffZ", CultureInfo.InvariantCulture) + "-" + Guid.NewGuid().ToString("N").Substring(0,8));
+                Directory.CreateDirectory(recordDir);
+                File.Copy(manifestPath, Path.Combine(recordDir, "Manifest.json"));
+                File.WriteAllText(Path.Combine(recordDir, "training.log"), stdout, Encoding.UTF8);
+                var record = new StringBuilder();
+                record.AppendLine("{");
+                record.AppendLine("  \"schema\": \"ntc-bake-training/v1\",");
+                record.AppendLine("  \"stableId\": \"" + JsonEscape(entry.stableId) + "\",");
+                record.AppendLine("  \"steps\": " + entry.trainingSteps + ",");
+                record.AppendLine("  \"bpp\": " + bpp.ToString(CultureInfo.InvariantCulture) + ",");
+                record.AppendLine("  \"metalnessLossScale\": " + metalLossScale.ToString(CultureInfo.InvariantCulture) + ",");
+                record.AppendLine("  \"smoothnessLossScale\": " + smoothLossScale.ToString(CultureInfo.InvariantCulture) + ",");
+                record.AppendLine("  \"cliSha256\": \"" + FileSha256(ntcCli) + "\",");
+                record.AppendLine("  \"ntcSha256\": \"" + FileSha256(ntcOutput) + "\",");
+                record.AppendLine("  \"commandLine\": \"" + JsonEscape(args) + "\"");
+                record.AppendLine("}");
+                File.WriteAllText(Path.Combine(recordDir, "parameters.json"), record.ToString(), Encoding.UTF8);
+                var hashes = new StringBuilder();
+                foreach (var texture in convertedTextures)
+                    hashes.AppendLine(texture.outName + ".png " + FileSha256(Path.Combine(tempDir, texture.outName + ".png")));
+                File.WriteAllText(Path.Combine(recordDir, "input-sha256.txt"), hashes.ToString(), Encoding.UTF8);
                 UpdateMaterialProgress(index, total, 0.92f, entry.materialName + ": decompressing preview PNGs...");
                 string decompDir = Path.Combine(outputDir, "Decompressed", Path.GetFileNameWithoutExtension(ntcOutput));
                 Directory.CreateDirectory(decompDir);
@@ -837,6 +859,13 @@ namespace Ntc.UnityEditorTools
         static string JsonEscape(string value)
         {
             return (value ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        static string FileSha256(string path)
+        {
+            using (var stream = File.OpenRead(path))
+            using (var algorithm = System.Security.Cryptography.SHA256.Create())
+                return BitConverter.ToString(algorithm.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
         }
 
         bool ConvertToPng(string srcPath, string outPath, string python, string channelSwizzle)

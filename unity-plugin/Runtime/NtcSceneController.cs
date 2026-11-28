@@ -1377,7 +1377,7 @@ namespace Ntc.Unity
             try
             {
                 _loadStatus = "Loading on-Sample NTC: " + g.name;
-                g.container = NtcContainerReader.Load(ntcAbsPath);
+                g.container = NtcContainerReader.LoadMetadata(ntcAbsPath);
                 g.assets = NtcAssetBuilder.Build(g.container, 0);
                 g.hasNtcData = g.assets != null && g.assets.LatentTexture != null && g.assets.WeightBuffer != null;
                 if (g.hasNtcData)

@@ -77,7 +77,7 @@ namespace Ntc.Packing
             }
             sb.AppendLine(string.Format("Buffer views      : {0} total, {1} GDeflate-compressed ({2} bytes -> {3} bytes)",
                 doc.Views.Count, compressedViewCount, compressedBytes, uncompressedBytes));
-            sb.AppendLine(string.Format("Data chunk size   : {0} bytes", container.DataChunk.Length));
+            sb.AppendLine(string.Format("Data chunk size   : {0} bytes", container.DataLength));
 
             return sb.ToString();
         }

@@ -44,6 +44,8 @@ $RECYCLE.BIN/
 .DS_Store
 .AppleDouble
 .LSOverride
+__pycache__/
+*.pyc
 
 # Archives and local binary builds should be published as release artifacts, not
 # committed to the source tree. Files inside the NVIDIA submodule are governed by

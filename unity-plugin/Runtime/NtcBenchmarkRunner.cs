@@ -67,6 +67,9 @@ namespace Ntc.Unity
             public MetricSummary renderThreadMs;
             public MetricSummary gpuFrameMs;
             public string gpuTimingStatus;
+            public bool frameCaptureSucceeded;
+            public string frameCaptureStatus;
+            public string frameCapturePath;
             public bool gpuFenceAvailable;
             public bool gpuFencePassed;
             public double gpuQueueDrainSeconds = -1;
@@ -90,6 +93,8 @@ namespace Ntc.Unity
         public sealed class SceneSnapshot
         {
             public NtcMemorySnapshot memory;
+            public NtcProcessMemory.Snapshot processMemory;
+            public long managedHeapBytes, retainedContainerBytes;
             public bool originalsReleased;
             public int directMaterialGroups, originalFallbackGroups;
             public int totalGroups;
@@ -129,6 +134,7 @@ namespace Ntc.Unity
         static readonly FieldInfo StreamerField = typeof(NtcSceneController).GetField("_streamer", PrivateInstance);
 
         readonly List<FrameSample> _rawSamples = new List<FrameSample>();
+        readonly FrameTiming[] _latestTiming = new FrameTiming[1];
         ProfilerRecorder _mainThreadRecorder;
         ProfilerRecorder _renderThreadRecorder;
         NtcSceneController _controller;
@@ -166,6 +172,7 @@ namespace Ntc.Unity
         {
             if (_started || !HasFlag("-ntcBenchmark")) return;
             _started = true;
+            foreach (var presenter in FindObjectsOfType<NtcShowcasePresenter>()) presenter.enabled = false;
             GameObject host = new GameObject("NTC Benchmark Runner");
             DontDestroyOnLoad(host);
             host.AddComponent<NtcBenchmarkRunner>();
@@ -197,10 +204,19 @@ namespace Ntc.Unity
                 yield break;
             }
             _controller.showPanel = false;
+            if (HasFlag("-ntcBenchmarkReleaseOriginals")) _controller.releaseOriginalTextures = true;
+            if (HasFlag("-ntcBenchmarkRetainOriginals")) _controller.releaseOriginalTextures = false;
             _lockedCamera = Camera.main;
             _lockCameraTransform = !HasFlag("-ntcBenchmarkAllowCameraMotion");
             if (_lockedCamera != null)
             {
+                UnityEngine.Debug.Log("[NTC Benchmark] Quality=" + QualitySettings.names[QualitySettings.GetQualityLevel()]
+                    + " pipeline=" + GraphicsSettings.currentRenderPipeline + " cameraEnabled=" + _lockedCamera.enabled);
+                if (HasFlag("-ntcBenchmarkShowcaseCamera"))
+                {
+                    _lockedCamera.transform.SetPositionAndRotation(new Vector3(1f, 2.1f, 7.5f), Quaternion.Euler(0,199,0));
+                    _lockedCamera.fieldOfView = 50f;
+                }
                 // Occlusion results can vary with driver/window state. Frustum visibility is
                 // sufficient for exercising the streamer's renderer.isVisible path.
                 _lockedCamera.useOcclusionCulling = false;
@@ -236,7 +252,7 @@ namespace Ntc.Unity
                 const string message = "No rendered frame was observed from the benchmark camera.";
                 if (!_allowNoRenderedFrame)
                 {
-                    FinishWithError(message + " Run a normal hidden Player; do not pass -batchmode or -nographics. Use -ntcBenchmarkAllowNoRenderedFrame only for compute/resource validation.");
+                    FinishWithError(message + " Run a visible Player with Run-NtcBenchmark.ps1 -Visible; do not pass -batchmode or -nographics. Use -ntcBenchmarkAllowNoRenderedFrame only for compute/resource validation.");
                     yield break;
                 }
                 UnityEngine.Debug.LogWarning("[NTC Benchmark] " + message + " Continuing because -ntcBenchmarkAllowNoRenderedFrame was supplied; frame-performance data is invalid.");
@@ -252,6 +268,7 @@ namespace Ntc.Unity
                 ModeReport modeReport = new ModeReport { mode = modes[i].ToString() };
                 yield return RunMode(modes[i], modeReport);
                 modeReports.Add(modeReport);
+                File.WriteAllText(Path.Combine(_outputDirectory, modes[i] + "-result.json"), JsonUtility.ToJson(modeReport, true));
             }
 
             report.modes = modeReports.ToArray();
@@ -279,6 +296,8 @@ namespace Ntc.Unity
         {
             if (_lockedCamera == null || !_lockCameraTransform) return;
             _lockedCamera.transform.SetPositionAndRotation(_lockedCameraPosition, _lockedCameraRotation);
+            _lockedCamera.ResetWorldToCameraMatrix();
+            _lockedCamera.ResetProjectionMatrix();
         }
 
         void OnDestroy()
@@ -332,7 +351,7 @@ namespace Ntc.Unity
                     && snapshot.eligibleStreamEntries > 0
                     && (!streamReady || snapshot.residentTiles < snapshot.totalVisibleTiles);
                 if (_renderDocCaptureRequested && !_renderDocCaptureAttempted && streamWorkPending)
-                    yield return CaptureRenderDocStreamingFrame();
+                    yield return CaptureRenderDocFrame();
 
                 if (!applying && streamReady) stableFrames++; else stableFrames = 0;
                 if (stableFrames >= 5)
@@ -401,6 +420,28 @@ namespace Ntc.Unity
                 ? "FrameTimingManager returned GPU frame times"
                 : "unavailable; use frameInterval/cpu/mainThread/renderThread metrics or an external GPU profiler (not substituted as GPU time)";
             report.afterSamples = CaptureSnapshot();
+            // Readback and encoding are deliberately outside the timed interval.
+            if (HasFlag("-ntcBenchmarkScreenshots") && _offscreenTarget != null)
+            {
+                yield return _waitForEndOfFrame;
+                RenderTexture previous = RenderTexture.active;
+                Texture2D image = new Texture2D(_offscreenTarget.width, _offscreenTarget.height, TextureFormat.RGB24, false);
+                try
+                {
+                    RenderTexture.active = _offscreenTarget;
+                    image.ReadPixels(new Rect(0, 0, image.width, image.height), 0, 0);
+                    image.Apply();
+                    File.WriteAllBytes(Path.Combine(_outputDirectory, mode + ".png"), image.EncodeToPNG());
+                }
+                finally { RenderTexture.active = previous; Destroy(image); }
+            }
+            if (HasFlag("-ntcBenchmarkCaptureSteadyFrames"))
+            {
+                yield return CaptureRenderDocFrame(mode.ToString());
+                report.frameCaptureSucceeded = _renderDocCaptureSucceeded;
+                report.frameCaptureStatus = _renderDocCaptureStatus;
+                report.frameCapturePath = _renderDocCapturePathTemplate;
+            }
         }
 
         IEnumerator DrainGpuQueue(ModeReport report)
@@ -456,11 +497,12 @@ namespace Ntc.Unity
                 : "timeout waiting for GPU fence";
         }
 
-        IEnumerator CaptureRenderDocStreamingFrame()
+        IEnumerator CaptureRenderDocFrame(string label = "ntc-onsample")
         {
             _renderDocCaptureAttempted = true;
+            _renderDocCaptureSucceeded = false;
             string captureDirectory = Path.Combine(_outputDirectory, "renderdoc");
-            _renderDocCapturePathTemplate = Path.Combine(captureDirectory, "ntc-onsample");
+            _renderDocCapturePathTemplate = Path.Combine(captureDirectory, label);
             Directory.CreateDirectory(captureDirectory);
 
             RenderDocApi api;
@@ -472,57 +514,35 @@ namespace Ntc.Unity
                 yield break;
             }
 
-            bool captureStarted = false;
-            try
+            uint previousCount = api.CaptureCount;
+            api.TriggerCapture();
+            Stopwatch timer = Stopwatch.StartNew();
+            // RenderDoc brackets the next complete Present frame on the rendering thread.
+            // Main-thread Start/End can finish before Unity submits its camera command lists.
+            while (api.CaptureCount <= previousCount && timer.Elapsed.TotalSeconds < _gpuFenceTimeout)
+                yield return _waitForEndOfFrame;
+            string recordedPath = api.CaptureCount > previousCount ? api.GetCapturePath(previousCount) : null;
+            _renderDocCaptureSucceeded = !string.IsNullOrEmpty(recordedPath) && File.Exists(recordedPath);
+            if (_renderDocCaptureSucceeded)
             {
-                api.SetCaptureFilePathTemplate(_renderDocCapturePathTemplate);
-                api.StartFrameCapture();
-                captureStarted = api.IsFrameCapturing();
-                if (!captureStarted)
-                {
-                    _renderDocCaptureStatus = "RenderDoc API was available, but StartFrameCapture did not begin a capture.";
-                    UnityEngine.Debug.LogWarning("[NTC Benchmark] " + _renderDocCaptureStatus);
-                }
+                string retainedPath = _renderDocCapturePathTemplate + ".rdc";
+                if (!string.Equals(Path.GetFullPath(recordedPath),Path.GetFullPath(retainedPath),StringComparison.OrdinalIgnoreCase))
+                    File.Copy(recordedPath,retainedPath,true);
+                _renderDocCapturePathTemplate = retainedPath;
             }
-            catch (Exception e)
-            {
-                _renderDocCaptureSucceeded = false;
-                _renderDocCaptureStatus = e.GetType().Name + ": " + e.Message;
-                UnityEngine.Debug.LogWarning("[NTC Benchmark] RenderDoc capture failed: " + _renderDocCaptureStatus);
-            }
-            if (!captureStarted) yield break;
-
-            // Cross the next player-loop Update so the active capture includes the tile streamer's
-            // compute submissions, then finish only after that frame has rendered.
-            yield return null;
-            yield return _waitForEndOfFrame;
-            try
-            {
-                _renderDocCaptureSucceeded = api.EndFrameCapture();
-                _renderDocCaptureStatus = _renderDocCaptureSucceeded
-                    ? "captured one on-Sample streaming frame including the next Update and render"
-                    : "EndFrameCapture reported failure";
-                if (_renderDocCaptureSucceeded)
-                    UnityEngine.Debug.Log("[NTC Benchmark] RenderDoc capture succeeded. Path template: " + _renderDocCapturePathTemplate);
-                else
-                    UnityEngine.Debug.LogWarning("[NTC Benchmark] RenderDoc capture failed: " + _renderDocCaptureStatus);
-            }
-            catch (Exception e)
-            {
-                _renderDocCaptureSucceeded = false;
-                _renderDocCaptureStatus = e.GetType().Name + ": " + e.Message;
-                UnityEngine.Debug.LogWarning("[NTC Benchmark] RenderDoc capture failed: " + _renderDocCaptureStatus);
-            }
+            _renderDocCaptureStatus = _renderDocCaptureSucceeded
+                ? "saved complete presented-frame capture; inspect draw events with Analyze-NtcCapture.py"
+                : "queued capture produced no retained file; reported path: " + recordedPath;
+            UnityEngine.Debug.Log("[NTC Benchmark] " + _renderDocCaptureStatus);
         }
 
         FrameSample CaptureFrameSample(string mode, int index, double intervalMs)
         {
             FrameSample sample = new FrameSample { mode = mode, index = index, intervalMs = intervalMs };
-            FrameTiming[] timings = new FrameTiming[1];
-            if (FrameTimingManager.GetLatestTimings(1, timings) > 0)
+            if (FrameTimingManager.GetLatestTimings(1, _latestTiming) > 0)
             {
-                if (timings[0].cpuFrameTime > 0) sample.cpuFrameMs = timings[0].cpuFrameTime;
-                if (timings[0].gpuFrameTime > 0) sample.gpuFrameMs = timings[0].gpuFrameTime;
+                if (_latestTiming[0].cpuFrameTime > 0) sample.cpuFrameMs = _latestTiming[0].cpuFrameTime;
+                if (_latestTiming[0].gpuFrameTime > 0) sample.gpuFrameMs = _latestTiming[0].gpuFrameTime;
             }
             sample.mainThreadMs = RecorderMilliseconds(_mainThreadRecorder);
             sample.renderThreadMs = RecorderMilliseconds(_renderThreadRecorder);
@@ -533,6 +553,8 @@ namespace Ntc.Unity
         {
             SceneSnapshot s = new SceneSnapshot();
             s.memory = _controller.MemorySnapshot;
+            s.processMemory = NtcProcessMemory.Capture(SystemInfo.graphicsDeviceVendorID, SystemInfo.graphicsDeviceID);
+            s.managedHeapBytes = GC.GetTotalMemory(false);
             s.originalsReleased = _controller.OriginalsReleased;
             NtcSceneController.MaterialGroup[] groups = _controller.groups ?? new NtcSceneController.MaterialGroup[0];
             Plane[] planes = _lockedCamera != null ? GeometryUtility.CalculateFrustumPlanes(_lockedCamera) : null;
@@ -541,10 +563,14 @@ namespace Ntc.Unity
             {
                 NtcSceneController.MaterialGroup g = groups[i];
                 if (g == null) continue;
+                if (g.container != null && g.container.DataChunk != null) s.retainedContainerBytes += g.container.DataChunk.LongLength;
                 if (g.hasNtcFile) s.bakedGroups++;
                 if (g.hasNtcData) s.gpuDataGroups++;
-                if (g.status != null && g.status.StartsWith("direct NTC PBR ready",StringComparison.Ordinal)) s.directMaterialGroups++;
-                if (g.status != null && g.status.StartsWith("direct original fallback:",StringComparison.Ordinal)) s.originalFallbackGroups++;
+                if (_controller.mode == NtcSceneController.NtcMode.InferenceOnSampleDirect)
+                {
+                    if (g.status != null && g.status.StartsWith("direct NTC PBR ready",StringComparison.Ordinal)) s.directMaterialGroups++;
+                    if (g.status != null && g.status.StartsWith("direct original fallback:",StringComparison.Ordinal)) s.originalFallbackGroups++;
+                }
                 if (IsFailureStatus(g.status)) s.failedGroups++;
                 bool visible = false;
                 bool inFrustum = false;
@@ -670,8 +696,8 @@ namespace Ntc.Unity
         void ConfigureOffscreenRendering()
         {
             if (_lockedCamera == null) return;
-            int width = Mathf.Max(Screen.width, 1);
-            int height = Mathf.Max(Screen.height, 1);
+            int width = GetIntArg("-ntcBenchmarkWidth", Mathf.Max(Screen.width, 1), 1);
+            int height = GetIntArg("-ntcBenchmarkHeight", Mathf.Max(Screen.height, 1), 1);
             _previousCameraTarget = _lockedCamera.targetTexture;
             _offscreenTarget = new RenderTexture(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Default)
             {
@@ -704,8 +730,8 @@ namespace Ntc.Unity
                 graphicsDeviceName = SystemInfo.graphicsDeviceName,
                 graphicsDeviceType = SystemInfo.graphicsDeviceType.ToString(),
                 graphicsMemoryMB = SystemInfo.graphicsMemorySize,
-                width = Screen.width,
-                height = Screen.height,
+                width = _offscreenTarget != null ? _offscreenTarget.width : Screen.width,
+                height = _offscreenTarget != null ? _offscreenTarget.height : Screen.height,
                 batchMode = Application.isBatchMode,
                 cameraName = cam != null ? cam.name : "unavailable",
                 cameraPosition = cam != null ? VectorString(cam.transform.position) : "unavailable",
@@ -714,7 +740,7 @@ namespace Ntc.Unity
                 startupToControllerReadySeconds = startupSeconds,
                 outputDirectory = _outputDirectory,
                 commandLine = Environment.GetCommandLineArgs(),
-                renderDocCaptureRequested = _renderDocCaptureRequested,
+                renderDocCaptureRequested = _renderDocCaptureRequested || HasFlag("-ntcBenchmarkCaptureSteadyFrames"),
                 renderDocCaptureStatus = _renderDocCaptureStatus
             };
         }
@@ -728,9 +754,8 @@ namespace Ntc.Unity
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             const int ApiVersion100 = 10000;
             const int SetCaptureFilePathTemplateSlot = 11;
-            const int StartFrameCaptureSlot = 19;
-            const int IsFrameCapturingSlot = 20;
-            const int EndFrameCaptureSlot = 21;
+            const int GetNumCapturesSlot = 13;
+            const int TriggerCaptureSlot = 15;
 
             [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
             delegate int GetApiDelegate(int version, out IntPtr apiPointers);
@@ -739,13 +764,7 @@ namespace Ntc.Unity
             delegate void SetCapturePathDelegate(IntPtr utf8Path);
 
             [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-            delegate void StartFrameCaptureDelegate(IntPtr device, IntPtr window);
-
-            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-            delegate uint IsFrameCapturingDelegate();
-
-            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-            delegate uint EndFrameCaptureDelegate(IntPtr device, IntPtr window);
+            delegate uint CaptureCountDelegate();
 
             [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = false)]
             static extern IntPtr GetModuleHandle(string moduleName);
@@ -753,17 +772,21 @@ namespace Ntc.Unity
             [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = false)]
             static extern IntPtr GetProcAddress(IntPtr module, string procedureName);
 
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            delegate void TriggerCaptureDelegate();
+            [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+            delegate uint GetCaptureDelegate(uint index, [Out] byte[] path, ref uint length, out ulong timestamp);
+            readonly GetCaptureDelegate _getCapture;
+            readonly TriggerCaptureDelegate _triggerCapture;
+            readonly CaptureCountDelegate _captureCount;
             readonly SetCapturePathDelegate _setCapturePath;
-            readonly StartFrameCaptureDelegate _startFrameCapture;
-            readonly IsFrameCapturingDelegate _isFrameCapturing;
-            readonly EndFrameCaptureDelegate _endFrameCapture;
 
             RenderDocApi(IntPtr apiPointers)
             {
+                _getCapture = GetFunction<GetCaptureDelegate>(apiPointers, 14);
+                _triggerCapture = GetFunction<TriggerCaptureDelegate>(apiPointers, TriggerCaptureSlot);
+                _captureCount = GetFunction<CaptureCountDelegate>(apiPointers, GetNumCapturesSlot);
                 _setCapturePath = GetFunction<SetCapturePathDelegate>(apiPointers, SetCaptureFilePathTemplateSlot);
-                _startFrameCapture = GetFunction<StartFrameCaptureDelegate>(apiPointers, StartFrameCaptureSlot);
-                _isFrameCapturing = GetFunction<IsFrameCapturingDelegate>(apiPointers, IsFrameCapturingSlot);
-                _endFrameCapture = GetFunction<EndFrameCaptureDelegate>(apiPointers, EndFrameCaptureSlot);
             }
 #endif
 
@@ -828,30 +851,36 @@ namespace Ntc.Unity
 #endif
             }
 
-            public void StartFrameCapture()
+            public string GetCapturePath(uint index)
             {
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-                _startFrameCapture(IntPtr.Zero, IntPtr.Zero);
+                byte[] bytes = new byte[4096];
+                uint length = (uint)bytes.Length; ulong timestamp;
+                if (_getCapture(index, bytes, ref length, out timestamp) == 0 || length > bytes.Length) return null;
+                int count = Array.IndexOf(bytes,(byte)0);
+                return Encoding.UTF8.GetString(bytes,0,count >= 0 ? count : (int)length);
+#else
+                return null;
 #endif
             }
 
-            public bool IsFrameCapturing()
+            public uint CaptureCount
+            {
+                get {
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+                    return _captureCount();
+#else
+                    return 0;
+#endif
+                }
+            }
+            public void TriggerCapture()
             {
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-                return _isFrameCapturing() != 0;
-#else
-                return false;
+                _triggerCapture();
 #endif
             }
 
-            public bool EndFrameCapture()
-            {
-#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-                return _endFrameCapture(IntPtr.Zero, IntPtr.Zero) != 0;
-#else
-                return false;
-#endif
-            }
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             static T GetFunction<T>(IntPtr apiPointers, int slot) where T : class

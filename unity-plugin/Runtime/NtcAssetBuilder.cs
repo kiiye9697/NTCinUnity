@@ -161,7 +161,7 @@ namespace Ntc.Unity
         /// <summary>Validate the fixed shader contract before allocating any GPU resources.</summary>
         public static void ValidateInferenceModel(NtcContainer container, int mlpVersion = 0)
         {
-            if (container == null || container.Document == null || container.DataChunk == null)
+            if (container == null || container.Document == null || !container.HasDataSource)
                 throw new InvalidDataException("NTC container has no document or data chunk.");
             NtcTextureSetDocument doc = container.Document;
             if (mlpVersion < 0 || mlpVersion >= doc.MlpVersions.Count)
@@ -223,8 +223,8 @@ namespace Ntc.Unity
             NtcBufferView view = container.Document.Views[index];
             if (view.IsCompressed)
                 throw new NotSupportedException("NTC inference requires uncompressed views; rebake with --gdeflate off.");
-            if (view.StoredSize != expectedBytes || view.Offset < 0 || view.StoredSize > container.DataChunk.LongLength
-                || view.Offset > container.DataChunk.LongLength - view.StoredSize)
+            if (view.StoredSize != expectedBytes || view.Offset < 0 || view.StoredSize > container.DataLength
+                || view.Offset > container.DataLength - view.StoredSize)
                 throw new InvalidDataException("NTC inference buffer view " + index + " has an invalid size or range.");
         }
 

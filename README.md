@@ -2,6 +2,8 @@
 
 基于 NVIDIA RTXNTC 的 Unity URP 神经纹理压缩插件，提供材质纹理烘焙、压缩资产管理、GPU 解码和 PBR 材质采样。
 
+[技术报告](https://www.kiiye9697.cn/writing/31-ntc-unity-material-texture-compression/) · [画面与贴图 A/B](https://www.kiiye9697.cn/ntc/)
+
 NTC 将同一材质的多张纹理及其 mip 链联合编码为特征网格与小型神经网络，在访问纹理时重建所需通道。算法参考 SIGGRAPH 2023 论文 [Random-Access Neural Compression of Material Textures](https://research.nvidia.com/labs/rtr/neural_texture_compression/)，离线训练使用 [NVIDIA RTXNTC](https://github.com/NVIDIA-RTX/RTXNTC)。
 
 ## 功能

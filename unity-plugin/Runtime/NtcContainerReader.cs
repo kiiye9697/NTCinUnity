@@ -109,13 +109,17 @@ namespace Ntc.Packing
     }
 
     /// <summary>
-    /// A fully parsed NTC container: the JSON document plus the raw bytes of the binary data chunk.
+    /// Parsed NTC metadata with either a resident binary chunk or a file-backed view source.
     /// </summary>
     public class NtcContainer
     {
         public uint ContainerVersion;
         public NtcTextureSetDocument Document;
-        public byte[] DataChunk; // raw bytes of the whole "Data Chunk" (views index into this)
+        public byte[] DataChunk; // Null for LoadMetadata; GetViewBytes reads only the requested range.
+        internal string SourcePath;
+        internal long SourceDataOffset, SourceDataLength;
+        public long DataLength { get { return DataChunk != null ? DataChunk.LongLength : SourceDataLength; } }
+        public bool HasDataSource { get { return DataChunk != null || SourcePath != null; } }
 
         /// <summary>
         /// Returns the raw (possibly still GDeflate-compressed) bytes for a BufferView by index.
@@ -135,11 +139,29 @@ namespace Ntc.Packing
                     " compression, but the Unity POC reader only supports uncompressed views. " +
                     "Rebake with ntc-cli option: --gdeflate off");
             }
-            if (view.Offset < 0 || view.StoredSize < 0 || view.Offset + view.StoredSize > DataChunk.Length)
+            long chunkLength = DataLength;
+            if (view.Offset < 0 || view.StoredSize < 0 || view.StoredSize > int.MaxValue
+                || view.Offset > chunkLength || view.StoredSize > chunkLength - view.Offset)
                 throw new InvalidDataException("NTC buffer view " + viewIndex + " points outside the data chunk.");
 
-            byte[] result = new byte[view.StoredSize];
-            Buffer.BlockCopy(DataChunk, (int)view.Offset, result, 0, (int)view.StoredSize);
+            byte[] result = new byte[(int)view.StoredSize];
+            if (DataChunk != null)
+                Buffer.BlockCopy(DataChunk, (int)view.Offset, result, 0, result.Length);
+            else
+            {
+                if (SourcePath == null) throw new InvalidOperationException("NTC container has no binary data source.");
+                using (var stream = File.OpenRead(SourcePath))
+                {
+                    stream.Seek(SourceDataOffset + view.Offset, SeekOrigin.Begin);
+                    int read = 0;
+                    while (read < result.Length)
+                    {
+                        int count = stream.Read(result, read, result.Length - read);
+                        if (count == 0) throw new EndOfStreamException("NTC buffer view was truncated: " + viewIndex);
+                        read += count;
+                    }
+                }
+            }
             return result;
         }
     }
@@ -150,10 +172,23 @@ namespace Ntc.Packing
 
         public static NtcContainer Load(string path)
         {
+            return Load(path, false);
+        }
+
+        // GPU upload consumes only selected views. Avoid retaining the entire container's
+        // binary chunk (including unused weight variants/BC metadata) for the scene lifetime.
+        public static NtcContainer LoadMetadata(string path)
+        {
+            return Load(path, true);
+        }
+
+        static NtcContainer Load(string path, bool deferBinaryData)
+        {
             using (FileStream fs = File.OpenRead(path))
             using (BinaryReader br = new BinaryReader(fs))
             {
                 byte[] signature = br.ReadBytes(4);
+                if (signature.Length != 4) throw new EndOfStreamException("Truncated NTC signature.");
                 for (int i = 0; i < 4; i++)
                 {
                     if (signature[i] != ExpectedSignature[i])
@@ -166,6 +201,12 @@ namespace Ntc.Packing
                 ulong dataOffset = br.ReadUInt64();
                 ulong dataSize = br.ReadUInt64();
 
+                ulong length = (ulong)fs.Length;
+                if (jsonOffset > length || jsonSize > length - jsonOffset || jsonSize > int.MaxValue
+                    || dataOffset > length || dataSize > length - dataOffset
+                    || (!deferBinaryData && dataSize > int.MaxValue))
+                    throw new InvalidDataException("NTC JSON or binary chunk lies outside the file or exceeds the reader limit.");
+
                 fs.Seek((long)jsonOffset, SeekOrigin.Begin);
                 byte[] jsonBytes = br.ReadBytes((int)jsonSize);
                 string jsonText = Encoding.UTF8.GetString(jsonBytes);
@@ -174,12 +215,15 @@ namespace Ntc.Packing
                 NtcTextureSetDocument document = ParseDocument(NtcJson.AsObject(root));
 
                 fs.Seek((long)dataOffset, SeekOrigin.Begin);
-                byte[] dataChunk = br.ReadBytes((int)dataSize);
+                byte[] dataChunk = deferBinaryData ? null : br.ReadBytes((int)dataSize);
 
                 NtcContainer container = new NtcContainer();
                 container.ContainerVersion = containerVersion;
                 container.Document = document;
                 container.DataChunk = dataChunk;
+                container.SourcePath = Path.GetFullPath(path);
+                container.SourceDataOffset = (long)dataOffset;
+                container.SourceDataLength = (long)dataSize;
                 return container;
             }
         }
