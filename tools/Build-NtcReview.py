@@ -3,6 +3,7 @@
 Requires Pillow, numpy and matplotlib. Art stays in the selected local output directory.
 """
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -90,9 +91,26 @@ def source_image(path, channel):
     return image.getchannel(channel).convert('RGB')
 
 
+def material_binding(assets, name):
+    materials = list((assets/'ClassicSponza/Art').rglob(name+'.mat'))
+    if len(materials) != 1:
+        raise ValueError('Expected one source material named '+name)
+    material = materials[0]
+    guid = re.search(r'^guid: (\w+)', material.with_suffix('.mat.meta').read_text(encoding='utf-8'), re.M).group(1)
+    matches = []
+    for binding in (assets/'NtcBindings').glob('*.asset'):
+        text = binding.read_text(encoding='utf-8')
+        source = re.search(r'editorSourceMaterial:.*?guid: (\w+)', text)
+        if source and source.group(1) == guid:
+            relative = re.search(r'^  streamingPath: (.+)$', text, re.M).group(1).strip('"')
+            matches.append((assets/'StreamingAssets'/relative, binding.stem))
+    if len(matches) != 1:
+        raise ValueError('Expected one GUID texture-set binding for '+name+'; prepare the scene bindings first.')
+    return material, matches[0][0], matches[0][1]
+
+
 def build(args):
     assets = args.project.resolve() / 'Assets'
-    ntc_dir = assets / 'NtcPlugin/NtcData'
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     media = output / 'media'
@@ -108,7 +126,7 @@ def build(args):
     names = args.materials.split(',')
     materials = []
     for name in names:
-        ntc = ntc_dir / (name + '.ntc')
+        material_path, ntc, stable_id = material_binding(assets, name)
         doc, data, binary = container(ntc)
         folder = output / name
         folder.mkdir(exist_ok=True)
@@ -118,10 +136,7 @@ def build(args):
         (folder / 'decode.log').write_text(result.stdout + result.stderr, encoding='utf-8')
         if result.returncode:
             raise RuntimeError(f'Decode failed: {name}. See {folder / "decode.log"}')
-        mat_paths = list((assets / 'ClassicSponza/Art').rglob(name + '.mat'))
-        if len(mat_paths) != 1:
-            raise ValueError(f'Expected one material named {name}')
-        text = mat_paths[0].read_text()
+        text = material_path.read_text(encoding='utf-8')
         properties = dict(re.findall(r'- (_\w+):\s*\n\s*m_Texture: \{fileID: \d+, guid: (\w+), type: \d+\}', text))
         conventions = [('Color', '_BaseMap', 'RGB'), ('Normal', '_BumpMap', 'RGB'), ('AO', '_OcclusionMap', 'G'), ('Metalness', '_MetallicGlossMap', 'R'), ('Smoothness', '_MetallicGlossMap', 'A')]
         channels = []
@@ -164,7 +179,7 @@ def build(args):
         # UNORM8 channel payload at the container resolution, including declared mips.
         logical_channels = sum(t['numChannels'] for t in doc['textures'])
         raw = sum(max(1, doc['width'] >> i)*max(1, doc['height'] >> i)*logical_channels for i in range(doc.get('numColorMips', 1)))
-        materials.append(dict(name=name, width=doc['width'], height=doc['height'], channels=channels, ntcBytes=len(data), rawBytes=raw, sourceFileBytes=sum(p.stat().st_size for p in source_files), latentPackedBytes=latent_texels*2, latentExpandedBytes=latent_texels*4, latentImages=latent_images, weights=f'{name}/weights.png', layers=[f"{x['inputChannels']} → {x['outputChannels']}" for x in doc['mlpVersions'][0]['layers']]))
+        materials.append(dict(name=name, stableId=stable_id, ntcSha256=hashlib.sha256(data).hexdigest(), width=doc['width'], height=doc['height'], channels=channels, ntcBytes=len(data), rawBytes=raw, sourceFileBytes=sum(p.stat().st_size for p in source_files), latentPackedBytes=latent_texels*2, latentExpandedBytes=latent_texels*4, latentImages=latent_images, weights=f'{name}/weights.png', layers=[f"{x['inputChannels']} → {x['outputChannels']}" for x in doc['mlpVersions'][0]['layers']]))
         print(f'{name}: {len(channels)} channels, {len(data)} bytes', flush=True)
     frame_match = re.search(r'(\d+) frames each', (args.recording / 'recording.txt').read_text())
     if not frame_match:

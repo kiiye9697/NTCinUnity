@@ -10,7 +10,7 @@
 <div class="viewer" id="viewer">
  <video id="a" src="media/Original.mp4?range=1" poster="media/original.png" muted playsinline preload="auto"></video>
  <video id="b" class="right" src="media/NTC-Direct.mp4?range=1" poster="media/ntc-direct.png" muted playsinline preload="auto"></video>
- <span class="tag a">A · Original</span><span class="tag b">B · NTC</span>
+ <span class="tag a">A · Original（无 NTC）</span><span class="tag b">B · NTC Direct</span>
  <div class="divider" id="divider"></div><div class="handle" id="handle">‹ ›</div>
  <div class="wipe-hit" id="wipe" role="slider" tabindex="0" aria-label="A/B 分割位置" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div>
  <span id="status" class="status">加载两路画面…</span>
@@ -20,7 +20,7 @@
 <div class="pipeline" id="pipeline"></div><div class="detail" id="detail"></div><div class="stage-previews" id="stagePreviews"></div>
 <div class="metrics"><section class="metric"><h2>压缩大小</h2><div id="sizebars"></div><div class="muted">Raw：NTC 分辨率、UNORM8 有效通道、完整 mip。NTC：完整文件字节。</div></section><section class="metric"><h2>潜变量存储布局</h2><div id="latentbars"></div><div class="muted">相同特征数量的格式容量对照；BGRA4 需设备支持。此处不含权重、原图及其他缓冲。</div></section></div>
 <div class="section-title"><h2>通道画质</h2><span class="muted" id="quality"></span></div><div id="channels" class="channels"></div>
-<div class="texture-grid"><figure><img id="input" alt="压缩输入贴图"><figcaption>输入贴图</figcaption></figure><figure><img id="output" alt="当前 NTC 的重建贴图"><figcaption>NTC 重建</figcaption></figure><figure><img id="difference" alt="输入与重建的绝对误差乘八"><figcaption>绝对差值 ×8</figcaption></figure></div>
+<div class="texture-grid"><figure><img id="input" alt="Original 源贴图，无 NTC"><figcaption>Original 源贴图（无 NTC）</figcaption></figure><figure><img id="output" alt="同一材质通道的 NTC 重建"><figcaption>NTC 重建</figcaption></figure><figure><img id="difference" alt="相对 Original 的绝对误差乘八"><figcaption>相对 Original 的绝对差值 ×8</figcaption></figure></div>
 <div class="optimizations" id="optimizations"></div>
 <footer><p>导出图表：<a href="figures/compressed-size.svg">压缩大小</a> · <a href="figures/latent-layout.svg">特征格式</a> · <a href="figures/channel-quality.svg">通道画质</a></p>通道重建来自当前 .ntc 的 NVIDIA CLI 解码；最终材质效果看上方 Unity A/B。PSNR 在 8-bit 通道空间计算，尺寸不同时先将输入双线性缩放到 NTC 尺寸。点击图片查看全尺寸。</footer>
 </main>
@@ -54,10 +54,18 @@ document.addEventListener('keydown',e=>{if(e.target.tagName==='SELECT'||e.target
 const mib=x=>(x/1048576).toFixed(2)+' MiB';
 function bars(id,rows){const max=Math.max(...rows.map(x=>x[1]));$(id).innerHTML=rows.map(([label,value])=>`<div class="barrow"><span>${label}</span><div class="bar"><i style="width:${value/max*100}%"></i></div><span>${mib(value)}</span></div>`).join('')}
 let selected,selectedChannel;
-function channel(c){selectedChannel=c;for(const button of $('channels').children)button.setAttribute('aria-pressed',button.textContent===c.name);for(const [id,key]of [['input','input'],['output','output'],['difference','diff']]){$(id).src=c[key+'Preview']||c[key];$(id).dataset.full=c[key];}$('quality').textContent=`${c.name} · PSNR ${c.psnr===null?'∞':c.psnr.toFixed(2)} dB · ${c.sourceSize.join('×')} → ${c.outputSize.join('×')}`;}
+let channelLoad=0;
+function channel(c){
+ const version=++channelLoad,m=selected;selectedChannel=c;
+ for(const button of $('channels').children)button.setAttribute('aria-pressed',button.textContent===c.name);
+ const images=[['input','input'],['output','output'],['difference','diff']].map(([id,key])=>{const img=$(id);img.style.visibility='hidden';img.src=c[key+'Preview']||c[key];img.dataset.full=c[key];return img});
+ $('quality').textContent=m.name+' / '+c.name+' · 加载对应图片…';
+ Promise.all(images.map(img=>img.decode())).then(()=>{if(version!==channelLoad)return;for(const img of images)img.style.visibility='visible';$('quality').textContent=`${m.name} / ${c.name} · NTC vs Original · PSNR ${c.psnr===null?'∞':c.psnr.toFixed(2)} dB · ${c.sourceSize.join('×')} → ${c.outputSize.join('×')}`;}).catch(()=>{if(version===channelLoad)$('quality').textContent=m.name+' / '+c.name+' · 图片加载失败，请重新选择通道';});
+}
+
 function stage(i){for(const [n,button]of [...$('pipeline').children].entries())button.setAttribute('aria-pressed',n===i);const m=selected;const descriptions=[`输入：${m.channels.map(c=>c.name).join(' / ')}。下面保留各通道原图与重建图。`,`输出：${m.name}.ntc，${mib(m.ntcBytes)}。与同尺寸 UNORM8 通道+mip 的容量比 ${(m.rawBytes/m.ntcBytes).toFixed(2)}×。`,`输入 .ntc → 输出量化特征网格和网络权重。特征图为真实 mip 0 的前三个分量伪彩显示；权重单独显示。两者共同作为解码输入。`,`输入 UV / LOD + 特征网格 + 权重 → 一次材质组解码返回全部 PBR 通道。解码网络维度：${m.layers.join('，')}。权重图为第一层 INT8 数值。`,`重建的 Color / Normal / AO / Metalness / Smoothness 进入 URP Lit。最终效果见同机位 A/B；下面的通道图来自 SDK 解码。`];$('detail').textContent=descriptions[i];const previews=i===0?m.channels.map(c=>[c.inputPreview||c.input,c.name+' 输入',c.input]):i===2?[...m.latentImages.map((p,n)=>[(m.latentPreviews||[])[n]||p,'特征层 '+n,p]),[m.weights,'第一层 INT8 权重']]:i===3?m.channels.map(c=>[c.outputPreview||c.output,c.name+' 解码输出',c.output]):i===4?m.channels.map(c=>[c.outputPreview||c.output,c.name+' 重建',c.output]):[];$('stagePreviews').innerHTML=previews.map(([src,label,full])=>`<figure><img src="${src}" alt="${label}" data-full="${full||src}"><figcaption>${label}</figcaption></figure>`).join('');for(const img of $('stagePreviews').querySelectorAll('img'))img.onclick=()=>{$('zoomImage').src=img.dataset.full||img.src;$('zoom').showModal()};}
 function material(index){selected=data.materials[index];const m=selected;const stages=[['input','输入贴图',m.channels[0].inputPreview||m.channels[0].input,'PBR 通道'],['file','.ntc',m.channels[0].output,mib(m.ntcBytes)],['latent','特征与权重',(m.latentPreviews||[])[0]||m.latentImages[0],m.latentImages.length+' 层 + INT8 MLP'],['network','采样解码',m.channels[0].outputPreview||m.channels[0].output,'UV / LOD → PBR'],['output','材质输出','media/ntc-direct.png','URP Lit']];$('pipeline').innerHTML=stages.map(([symbol,title,img,caption],i)=>`<button class="node" data-stage="${i}">${icon(symbol)}<strong>${title}</strong>${symbol==='file'?'<div class="file-preview">'+icon('file')+'</div>':`<img src="${img}" alt="${title}">`}<small>${caption}</small></button>`).join('');for(const [i,button]of [...$('pipeline').children].entries())button.onclick=()=>stage(i);stage(0);bars('sizebars',[['UNORM8 + mip',m.rawBytes],['.ntc 文件',m.ntcBytes]]);bars('latentbars',[['RGBA32 展开',m.latentExpandedBytes],['BGRA4 打包',m.latentPackedBytes]]);$('channels').innerHTML=m.channels.map(c=>`<button>${c.name}</button>`).join('');for(const [i,button]of [...$('channels').children].entries())button.onclick=()=>channel(m.channels[i]);channel(m.channels[0]);$('optimizations').innerHTML=[['latent','4-bit 特征打包'],['network','整组 PBR 统一解码'],['output','循环采样共用解码入口']].map(([symbol,label])=>`<span>${icon(symbol)}${label}</span>`).join('')}
-$('material').innerHTML=data.materials.map((m,i)=>`<option value="${i}">${m.name}</option>`).join('');$('material').onchange=e=>material(Number(e.target.value));material(0);
+$('material').innerHTML=data.materials.map((m,i)=>`<option value="${i}">${m.name}</option>`).join('');function selectMaterial(index){material(index);window.dispatchEvent(new CustomEvent('ntc-material-change',{detail:{name:data.materials[index].name}}))}$('material').onchange=e=>selectMaterial(Number(e.target.value));selectMaterial(0);
 for(const id of ['input','output','difference'])$(id).onclick=()=>{$('zoomImage').src=$(id).dataset.full||$(id).src;$('zoom').showModal()};$('closeZoom').onclick=()=>$('zoom').close();
 </script>
 </html>
